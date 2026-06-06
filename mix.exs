@@ -6,6 +6,8 @@ defmodule Ector.MixProject do
       app: :ector,
       version: "0.1.0",
       elixir: "~> 1.20",
+      elixirc_paths: elixirc_paths(Mix.env()),
+      test_coverage: [ignore_modules: [Ector.TestRepo, Ector.TestRepo.SQLite, Ector.TestRepo.Postgres]],
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]
@@ -28,4 +30,7 @@ defmodule Ector.MixProject do
       {:benchee, "~> 1.5", only: [:dev, :test]}
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 end
