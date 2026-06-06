@@ -1,0 +1,339 @@
+defmodule Ector.QueryTest do
+  use ExUnit.Case, async: true
+  use ExUnitProperties
+
+  doctest Ector.Query
+
+  require Ector.Query
+
+  @physical_fields [:__id__, :label, :source_id, :target_id]
+
+  defmodule Cart do
+    use Ector.Node
+
+    schema do
+      field(:title, :string)
+      field(:status, :string)
+    end
+  end
+
+  defmodule HasCart do
+    use Ector.Edge
+
+    schema do
+      field(:status, :string)
+    end
+  end
+
+  defmodule User do
+    use Ector.Node
+
+    schema do
+      field(:email, :string)
+      field(:status, :string)
+      field(:custom_field, :string)
+
+      has_many(:carts, Cart, through: HasCart)
+    end
+  end
+
+  test "from/1 targets the shared nodes table and preserves the domain module" do
+    query = Ector.Query.from(u in User)
+
+    assert query.from.source == {"nodes", User}
+    assert [%Ecto.Query.BooleanExpr{} = label_filter] = query.wheres
+    assert label_filter.params == [{"User", {0, :label}}]
+    assert physical_field_access?(label_filter.expr, :label)
+  end
+
+  property "where/3 rewrites arbitrary domain fields to properties JSON paths" do
+    check all(field <- field_name_gen(), max_runs: 25) do
+      query = query_with_rewritten_clause(:where, field)
+
+      assert json_path_access?(List.last(query.wheres).expr, Atom.to_string(field))
+    end
+  end
+
+  property "select/3 rewrites arbitrary domain fields to properties JSON paths" do
+    check all(field <- field_name_gen(), max_runs: 25) do
+      query = query_with_rewritten_clause(:select, field)
+
+      assert json_path_access?(query.select.expr, Atom.to_string(field))
+    end
+  end
+
+  property "order_by/3 rewrites arbitrary domain fields to properties JSON paths" do
+    check all(field <- field_name_gen(), max_runs: 25) do
+      query = query_with_rewritten_clause(:order_by, field)
+
+      assert json_path_access?(hd(query.order_bys).expr, Atom.to_string(field))
+    end
+  end
+
+  property "group_by/3 rewrites arbitrary domain fields to properties JSON paths" do
+    check all(field <- field_name_gen(), max_runs: 25) do
+      query = query_with_rewritten_clause(:group_by, field)
+
+      assert json_path_access?(hd(query.group_bys).expr, Atom.to_string(field))
+    end
+  end
+
+  test "the JSON rewriter leaves physical fields unchanged" do
+    for field <- @physical_fields do
+      query = query_with_rewritten_clause(:where, field)
+
+      refute json_path_access?(List.last(query.wheres).expr, Atom.to_string(field))
+      assert physical_field_access?(List.last(query.wheres).expr, field)
+    end
+  end
+
+  test "the JSON rewriter maps domain id to the properties payload" do
+    query = query_with_rewritten_clause(:where, :id)
+
+    assert json_path_access?(List.last(query.wheres).expr, "id")
+    refute physical_field_access?(List.last(query.wheres).expr, :id)
+  end
+
+  test "the JSON rewriter leaves pinned values untouched and rewrites fragment fields" do
+    value = "active"
+    query = Ector.Query.from(c in User)
+    pinned_query = Ector.Query.where(query, [c], c.status == ^value)
+    fragment_query = Ector.Query.where(query, [c], fragment("? = ?", c.status, ^value))
+
+    pinned_filter = List.last(pinned_query.wheres)
+    fragment_filter = List.last(fragment_query.wheres)
+
+    assert pinned_filter.params == [{"active", :any}]
+    assert json_path_access?(pinned_filter.expr, "status")
+
+    assert json_path_access?(fragment_filter.expr, "status")
+    refute physical_field_access?(fragment_filter.expr, :status)
+  end
+
+  test "dynamic/2 rewrites domain fields to properties JSON paths" do
+    dynamic_expr = Ector.Query.dynamic([u], u.status == "active")
+    {expr, params, subqueries, aliases} = dynamic_expr.fun.(%Ecto.Query{})
+
+    assert params == []
+    assert subqueries == []
+    assert aliases == %{}
+    assert json_path_access?(expr, "status")
+  end
+
+  test "where/2 accepts rewritten dynamic expressions" do
+    dynamic_expr = Ector.Query.dynamic([u], u.status == "active")
+
+    query =
+      Ector.Query.from(u in User)
+      |> Ector.Query.where(^dynamic_expr)
+
+    assert json_path_access?(List.last(query.wheres).expr, "status")
+  end
+
+  test "pinned map field access is shielded from the rewriter" do
+    user = %{status: "active"}
+
+    query =
+      Ector.Query.from(c in User)
+      |> Ector.Query.where([c], ^user.status == "active")
+
+    filter = List.last(query.wheres)
+
+    assert [{"active", _type}] = filter.params
+    refute json_path_access?(filter.expr, "status")
+    refute physical_field_access?(filter.expr, :status)
+  end
+
+  test "or_where/3 rewrites domain fields and keeps OR semantics" do
+    query =
+      Ector.Query.from(c in User)
+      |> Ector.Query.where([c], c.status == "active")
+      |> Ector.Query.or_where([c], c.email == "ada@example.com")
+
+    assert %Ecto.Query.BooleanExpr{op: :or} = filter = List.last(query.wheres)
+    assert json_path_access?(filter.expr, "email")
+  end
+
+  test "or_having/3 rewrites domain fields and keeps OR semantics" do
+    query =
+      Ector.Query.from(c in User)
+      |> Ector.Query.group_by([c], c.status)
+      |> Ector.Query.having([c], c.status == "active")
+      |> Ector.Query.or_having([c], c.email == "ada@example.com")
+
+    assert %Ecto.Query.BooleanExpr{op: :or} = filter = List.last(query.havings)
+    assert json_path_access?(filter.expr, "email")
+  end
+
+  test "join/5 expands assoc joins into deterministic edge and target node joins" do
+    query = Ector.Query.from(u in User)
+    joined = Ector.Query.join(query, :left, [u], c in assoc(u, :carts), as: :cart)
+
+    assert [edge_join, target_join] = joined.joins
+    assert edge_join.qual == :left
+    assert edge_join.source == {"edges", Ector.Edge}
+    assert generated_edge_alias?(edge_join.as, :cart)
+    assert edge_join.prefix == nil
+    assert join_field_comparison?(edge_join.on.expr, 1, :source_id, 0, :__id__)
+    refute physical_field_access?(edge_join.on.expr, :id)
+    assert Enum.any?(edge_join.on.params, &match?({"HAS_CART", _type}, &1))
+
+    assert target_join.qual == :left
+    assert target_join.source == {"nodes", Cart}
+    assert target_join.as == :cart
+    assert target_join.prefix == nil
+    assert join_field_comparison?(target_join.on.expr, 2, :__id__, 1, :target_id)
+    refute physical_field_access?(target_join.on.expr, :id)
+    assert physical_field_access?(target_join.on.expr, :label)
+    assert Enum.any?(target_join.on.params, &match?({"Cart", _type}, &1))
+
+    assert joined.aliases[edge_join.as] == 1
+    assert joined.aliases.cart == 2
+  end
+
+  test "join/5 avoids collisions with user aliases that match old edge aliases" do
+    query =
+      Ector.Query.from(u in User)
+      |> Ector.Query.join(:inner, [u], marker in "nodes", as: :__edge_cart, on: true)
+
+    joined = Ector.Query.join(query, :left, [u, marker], c in assoc(u, :carts), as: :cart)
+
+    assert [user_join, edge_join, target_join] = joined.joins
+    assert user_join.as == :__edge_cart
+    assert generated_edge_alias?(edge_join.as, :cart)
+    refute edge_join.as == :__edge_cart
+    assert target_join.as == :cart
+    assert join_field_comparison?(edge_join.on.expr, 2, :source_id, 0, :__id__)
+    assert join_field_comparison?(target_join.on.expr, 3, :__id__, 2, :target_id)
+
+    assert joined.aliases.__edge_cart == 1
+    assert joined.aliases[edge_join.as] == 2
+    assert joined.aliases.cart == 3
+  end
+
+  defp query_with_rewritten_clause(kind, field) when is_atom(field) do
+    field_access = field_access_ast(field)
+    comparison = {:==, [], [field_access, "active"]}
+
+    quoted =
+      case kind do
+        :where ->
+          quote do
+            query = Ector.Query.from(c in unquote(User))
+            Ector.Query.where(query, [c], unquote(comparison))
+          end
+
+        :select ->
+          quote do
+            query = Ector.Query.from(c in unquote(User))
+            Ector.Query.select(query, [c], unquote(field_access))
+          end
+
+        :order_by ->
+          quote do
+            query = Ector.Query.from(c in unquote(User))
+            Ector.Query.order_by(query, [c], unquote(field_access))
+          end
+
+        :group_by ->
+          quote do
+            query = Ector.Query.from(c in unquote(User))
+            Ector.Query.group_by(query, [c], unquote(field_access))
+          end
+      end
+
+    {query, _binding} = Code.eval_quoted(quoted, [], __ENV__)
+    query
+  end
+
+  defp field_access_ast(field) when is_atom(field) do
+    {{:., [], [{:c, [], Elixir}, field]}, [], []}
+  end
+
+  defp json_path_access?(ast, field) when is_binary(field) do
+    ast
+    |> normalize_metadata()
+    |> ast_contains?(fn
+      {:json_extract_path, [],
+       [{{:., [], [{:&, [], [_binding_index]}, :properties]}, [], []}, [^field]]} ->
+        true
+
+      _other ->
+        false
+    end)
+  end
+
+  defp physical_field_access?(ast, field) when is_atom(field) do
+    ast
+    |> normalize_metadata()
+    |> ast_contains?(fn
+      {{:., [], [{:&, [], [_binding_index]}, ^field]}, [], []} -> true
+      _other -> false
+    end)
+  end
+
+  defp join_field_comparison?(ast, left_index, left_field, right_index, right_field) do
+    ast
+    |> normalize_metadata()
+    |> ast_contains?(fn
+      {:==, [],
+       [
+         {{:., [], [{:&, [], [^left_index]}, ^left_field]}, [], []},
+         {{:., [], [{:&, [], [^right_index]}, ^right_field]}, [], []}
+       ]} ->
+        true
+
+      {:==, [],
+       [
+         {{:., [], [{:&, [], [^right_index]}, ^right_field]}, [], []},
+         {{:., [], [{:&, [], [^left_index]}, ^left_field]}, [], []}
+       ]} ->
+        true
+
+      _other ->
+        false
+    end)
+  end
+
+  defp generated_edge_alias?(alias_name, target_alias)
+       when is_atom(alias_name) and is_atom(target_alias) do
+    Regex.match?(~r/^__edge_#{target_alias}_[1-9][0-9]*$/, Atom.to_string(alias_name))
+  end
+
+  defp ast_contains?(ast, predicate) when is_function(predicate, 1) do
+    {_ast, found?} =
+      Macro.prewalk(ast, false, fn node, found? ->
+        {node, found? or predicate.(node)}
+      end)
+
+    found?
+  end
+
+  defp normalize_metadata(ast) do
+    Macro.prewalk(ast, fn
+      {{:., _dot_meta, dot_args}, _call_meta, call_args} ->
+        {{:., [], dot_args}, [], call_args}
+
+      {name, _meta, args} when is_atom(name) and is_list(args) ->
+        {name, [], args}
+
+      other ->
+        other
+    end)
+  end
+
+  defp field_name_gen do
+    StreamData.bind(StreamData.member_of(letter_strings()), fn first ->
+      StreamData.map(
+        StreamData.list_of(StreamData.member_of(identifier_strings()), max_length: 8),
+        fn rest ->
+          String.to_atom(Enum.join([first | rest]))
+        end
+      )
+    end)
+    |> StreamData.filter(&(&1 not in @physical_fields and &1 != :properties))
+  end
+
+  defp letter_strings, do: Enum.map(?a..?z, &<<&1::utf8>>)
+  defp identifier_strings, do: letter_strings() ++ Enum.map(?0..?9, &<<&1::utf8>>) ++ ["_"]
+end
