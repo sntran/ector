@@ -7,7 +7,9 @@ defmodule Ector.MixProject do
       version: "0.1.0",
       elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
-      test_coverage: [ignore_modules: [Ector.TestRepo, Ector.TestRepo.SQLite, Ector.TestRepo.Postgres]],
+      test_coverage: [
+        ignore_modules: [Ector.TestRepo, Ector.TestRepo.SQLite, Ector.TestRepo.Postgres]
+      ],
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]

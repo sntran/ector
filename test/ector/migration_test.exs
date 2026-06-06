@@ -9,7 +9,7 @@ defmodule Ector.MigrationTest do
     use Ector.Node
 
     schema do
-      field :email, :string
+      field(:email, :string)
     end
   end
 
@@ -61,7 +61,14 @@ defmodule Ector.MigrationTest do
     assert Ector.TestRepo.table_exists?("edges")
 
     assert Ector.TestRepo.column_names("nodes") == ["id", "label", "properties"]
-    assert Ector.TestRepo.column_names("edges") == ["id", "label", "source_id", "target_id", "properties"]
+
+    assert Ector.TestRepo.column_names("edges") == [
+             "id",
+             "label",
+             "source_id",
+             "target_id",
+             "properties"
+           ]
 
     if Ector.TestRepo.postgres?() do
       assert Ector.TestRepo.column_type("nodes", "id") == "uuid"
@@ -85,7 +92,11 @@ defmodule Ector.MigrationTest do
   end
 
   test "index/3 rewrites schema fields into partial JSON property indexes" do
-    index = Ector.Migration.index(Ector.MigrationTest.IndexUser, [:email], prefix: "tenant_alpha", unique: true)
+    index =
+      Ector.Migration.index(Ector.MigrationTest.IndexUser, [:email],
+        prefix: "tenant_alpha",
+        unique: true
+      )
 
     assert to_string(index.table) == "nodes"
     assert index.columns == ["(properties->>'email')"]
@@ -117,8 +128,7 @@ defmodule Ector.MigrationTest do
         node, acc -> {node, acc}
       end)
 
-    assert "CREATE INDEX IF NOT EXISTS nodes_properties_gin ON \"tenant\"\"alpha\".\"nodes\" USING GIN (properties)" in
-             string_literals
+    assert "CREATE INDEX IF NOT EXISTS nodes_properties_gin ON \"tenant\"\"alpha\".\"nodes\" USING GIN (properties)" in string_literals
   end
 
   test "index/3 rejects null bytes" do
@@ -159,7 +169,9 @@ defmodule Ector.MigrationTest do
     assert_raise ArgumentError, ~r/index WHERE clause cannot contain SQL comment sequences/, fn ->
       Code.eval_quoted(
         quote do
-          Ector.Migration.index(Ector.MigrationTest.IndexUser, [:email], where: "active = TRUE -- injected")
+          Ector.Migration.index(Ector.MigrationTest.IndexUser, [:email],
+            where: "active = TRUE -- injected"
+          )
         end,
         [],
         __ENV__
@@ -192,7 +204,7 @@ defmodule Ector.MigrationTest do
                 [desc: :label],
                 where: "verified = TRUE"
               ),
-              Ector.Migration.index(Ector.MigrationTest.IndexUser, [desc: "lower(email)"]),
+              Ector.Migration.index(Ector.MigrationTest.IndexUser, desc: "lower(email)"),
               Ector.Migration.index(Ector.MigrationTest.IndexUser, ["lower(email)"])
             }
           end
@@ -200,7 +212,8 @@ defmodule Ector.MigrationTest do
         Macro.Env.location(__ENV__)
       )
 
-    {binary_table_index, atom_table_index, schema_index, directional_index, directional_expression_index, expression_index} =
+    {binary_table_index, atom_table_index, schema_index, directional_index,
+     directional_expression_index, expression_index} =
       module.build_indexes()
 
     assert to_string(binary_table_index.table) == "audit_logs"

@@ -8,7 +8,7 @@ defmodule Ector.EdgeTest do
     use Ector.Node
 
     schema do
-      field :name, :string
+      field(:name, :string)
     end
   end
 
@@ -16,7 +16,7 @@ defmodule Ector.EdgeTest do
     use Ector.Node
 
     schema do
-      field :title, :string
+      field(:title, :string)
     end
   end
 
@@ -24,10 +24,10 @@ defmodule Ector.EdgeTest do
     use Ector.Edge
 
     schema do
-      field :properties, :map, default: %{}
+      field(:properties, :map, default: %{})
 
-      belongs_to :user, User, role: :source
-      belongs_to :cart, Cart, role: :target
+      belongs_to(:user, User, role: :source)
+      belongs_to(:cart, Cart, role: :target)
     end
   end
 
@@ -70,7 +70,7 @@ defmodule Ector.EdgeTest do
           Ector.Edge.__using__()
 
           schema do
-            field :weight, :integer
+            field(:weight, :integer)
           end
         end,
         Macro.Env.location(__ENV__)
@@ -83,7 +83,7 @@ defmodule Ector.EdgeTest do
   end
 
   property "edge changesets preserve arbitrary property payloads without persisting __id__ input" do
-    check all attrs <- edge_attrs_gen() do
+    check all(attrs <- edge_attrs_gen()) do
       changeset = HasCart.changeset(%HasCart{}, attrs)
 
       assert %Ecto.Changeset{} = changeset
@@ -95,7 +95,7 @@ defmodule Ector.EdgeTest do
   end
 
   property "edge labels are deterministic for generated module names" do
-    check all module <- module_name_gen() do
+    check all(module <- module_name_gen()) do
       expected = module |> Module.split() |> List.last() |> Macro.underscore() |> String.upcase()
 
       assert Ector.Edge.label_for(module) == expected

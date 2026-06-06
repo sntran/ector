@@ -8,7 +8,7 @@ defmodule Ector.ChangesetTest do
     use Ector.Node
 
     schema do
-      field :name, :string
+      field(:name, :string)
     end
   end
 
@@ -16,7 +16,7 @@ defmodule Ector.ChangesetTest do
     use Ector.Node
 
     schema do
-      field :title, :string
+      field(:title, :string)
     end
   end
 
@@ -39,7 +39,7 @@ defmodule Ector.ChangesetTest do
   end
 
   property "put_edge preserves arbitrary edge property maps" do
-    check all edge_properties <- json_object_gen() do
+    check all(edge_properties <- json_object_gen()) do
       source = User.changeset(%User{}, %{"name" => "Ada"})
       target = Cart.changeset(%Cart{}, %{"title" => "Checkout"})
 
