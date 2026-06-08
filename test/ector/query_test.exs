@@ -4,6 +4,7 @@ defmodule Ector.QueryTest do
 
   doctest Ector.Query
 
+  require Ecto.Query
   require Ector.Query
 
   @physical_fields [:__id__, :label, :source_id, :target_id]
@@ -37,6 +38,56 @@ defmodule Ector.QueryTest do
     end
   end
 
+  defmodule PlainSchema do
+    use Ecto.Schema
+
+    schema "plain_schemas" do
+      field(:status, :string)
+    end
+  end
+
+  defmodule IncomingUser do
+    use Ector.Node
+
+    schema do
+      field(:email, :string)
+
+      belongs_to(:cart, Cart, through: "has_cart")
+    end
+  end
+
+  defmodule AtomThroughUser do
+    use Ector.Node
+
+    schema do
+      has_many(:legacy_carts, Cart, through: :legacy_cart)
+    end
+  end
+
+  defmodule BinaryThroughUser do
+    use Ector.Node
+
+    schema do
+      has_many(:legacy_carts, Cart, through: "legacy_cart")
+    end
+  end
+
+  defmodule NamedEdgeUser do
+    use Ector.Node
+
+    schema do
+      has_many(:line_items, Cart)
+    end
+  end
+
+  defmodule InvalidThroughUser do
+    use Ector.Node
+
+    schema do
+      has_many(:invalid_carts, Cart, through: 123)
+    end
+  end
+
   test "from/1 targets the shared nodes table and preserves the domain module" do
     query = Ector.Query.from(u in User)
 
@@ -44,6 +95,93 @@ defmodule Ector.QueryTest do
     assert [%Ecto.Query.BooleanExpr{} = label_filter] = query.wheres
     assert label_filter.params == [{"User", {0, :label}}]
     assert physical_field_access?(label_filter.expr, :label)
+  end
+
+  test "from/1 accepts bare Ector modules and falls back for non-Ector sources" do
+    bare_query = Ector.Query.from(User)
+
+    assert bare_query.from.source == {"nodes", User}
+    assert [%Ecto.Query.BooleanExpr{}] = bare_query.wheres
+
+    plain_query = Ector.Query.from(plain in PlainSchema, where: plain.status == "active")
+
+    assert plain_query.from.source == {"plain_schemas", PlainSchema}
+    assert json_path_access?(hd(plain_query.wheres).expr, "status")
+
+    string_source_query = Ector.Query.from(row in "plain_schemas", where: row.status == "active")
+
+    assert string_source_query.from.source == {"plain_schemas", nil}
+    assert json_path_access?(hd(string_source_query.wheres).expr, "status")
+
+    bare_string_query = Ector.Query.from("plain_schemas")
+
+    assert bare_string_query.from.source == {"plain_schemas", nil}
+    assert bare_string_query.wheres == []
+  end
+
+  test "from/1 supports list-shaped binding ASTs" do
+    source_ast = {:in, [], [[{:user, [], Elixir}], User]}
+
+    quoted =
+      {:__block__, [],
+       [
+         {:require, [], [Ector.Query]},
+         {{:., [], [Ector.Query, :from]}, [], [source_ast]}
+       ]}
+
+    {query, _binding} = Code.eval_quoted(quoted, [], __ENV__)
+
+    assert query.from.source == {"nodes", User}
+    assert [%Ecto.Query.BooleanExpr{}] = query.wheres
+  end
+
+  test "from/2 rejects non-keyword options" do
+    assert_raise ArgumentError, ~r/second argument to `from`/, fn ->
+      Code.eval_quoted(
+        quote do
+          require Ector.Query
+          Ector.Query.from(user in unquote(User), :not_a_keyword)
+        end,
+        [],
+        __ENV__
+      )
+    end
+  end
+
+  test "query default arities rewrite through Ecto.Query" do
+    {query, _binding} =
+      Code.eval_quoted(
+        quote do
+          require Ector.Query
+
+          Ector.Query.from(user in unquote(User))
+          |> Ector.Query.where(true)
+          |> Ector.Query.or_where(false)
+          |> Ector.Query.group_by(fragment("1"))
+          |> Ector.Query.having(true)
+          |> Ector.Query.or_having(false)
+          |> Ector.Query.order_by(fragment("1"))
+          |> Ector.Query.select(1)
+        end,
+        [],
+        __ENV__
+      )
+
+    assert query.select.expr == 1
+    assert length(query.wheres) == 2
+    assert length(query.havings) == 1
+
+    {dynamic_expr, _binding} =
+      Code.eval_quoted(
+        quote do
+          require Ector.Query
+          Ector.Query.dynamic(true)
+        end,
+        [],
+        __ENV__
+      )
+
+    assert %Ecto.Query.DynamicExpr{} = dynamic_expr
   end
 
   property "where/3 rewrites arbitrary domain fields to properties JSON paths" do
@@ -165,12 +303,12 @@ defmodule Ector.QueryTest do
     assert json_path_access?(filter.expr, "email")
   end
 
-  test "join/5 expands assoc joins into deterministic edge and target node joins" do
+  test "join/3 expands graph joins into deterministic edge and target node joins" do
     query = Ector.Query.from(u in User)
-    joined = Ector.Query.join(query, :left, [u], c in assoc(u, :carts), as: :cart)
+    joined = Ector.Query.join(query, :carts, as: :cart)
 
     assert [edge_join, target_join] = joined.joins
-    assert edge_join.qual == :left
+    assert edge_join.qual == :inner
     assert edge_join.source == {"edges", Ector.Edge}
     assert generated_edge_alias?(edge_join.as, :cart)
     assert edge_join.prefix == nil
@@ -178,7 +316,7 @@ defmodule Ector.QueryTest do
     refute physical_field_access?(edge_join.on.expr, :id)
     assert Enum.any?(edge_join.on.params, &match?({"HAS_CART", _type}, &1))
 
-    assert target_join.qual == :left
+    assert target_join.qual == :inner
     assert target_join.source == {"nodes", Cart}
     assert target_join.as == :cart
     assert target_join.prefix == nil
@@ -191,12 +329,12 @@ defmodule Ector.QueryTest do
     assert joined.aliases.cart == 2
   end
 
-  test "join/5 avoids collisions with user aliases that match old edge aliases" do
+  test "join/3 avoids collisions with user aliases that match old edge aliases" do
     query =
       Ector.Query.from(u in User)
-      |> Ector.Query.join(:inner, [u], marker in "nodes", as: :__edge_cart, on: true)
+      |> Ecto.Query.join(:inner, [u], marker in "nodes", as: :__edge_cart, on: true)
 
-    joined = Ector.Query.join(query, :left, [u, marker], c in assoc(u, :carts), as: :cart)
+    joined = Ector.Query.join(query, :carts, as: :cart)
 
     assert [user_join, edge_join, target_join] = joined.joins
     assert user_join.as == :__edge_cart
@@ -209,6 +347,116 @@ defmodule Ector.QueryTest do
     assert joined.aliases.__edge_cart == 1
     assert joined.aliases[edge_join.as] == 2
     assert joined.aliases.cart == 3
+  end
+
+  test "join/3 expands incoming graph joins and validates macro arguments" do
+    incoming_join =
+      IncomingUser
+      |> Ector.Query.from()
+      |> Ector.Query.join(:cart, as: :cart)
+
+    assert [edge_join, target_join] = incoming_join.joins
+    assert join_field_comparison?(edge_join.on.expr, 1, :target_id, 0, :__id__)
+    assert join_field_comparison?(target_join.on.expr, 2, :__id__, 1, :source_id)
+
+    query = Ector.Query.from(u in User)
+
+    assert_raise ArgumentError, ~r/compile time atom `as:` alias/, fn ->
+      Code.eval_quoted(
+        quote do
+          require Ector.Query
+          Ector.Query.join(unquote(Macro.escape(query)), :carts, as: "cart")
+        end,
+        [],
+        __ENV__
+      )
+    end
+
+    assert_raise ArgumentError, ~r/require an `as:` alias/, fn ->
+      Code.eval_quoted(
+        quote do
+          require Ector.Query
+          Ector.Query.join(unquote(Macro.escape(query)), :carts)
+        end,
+        [],
+        __ENV__
+      )
+    end
+
+    assert_raise ArgumentError, ~r/compile time atom association name/, fn ->
+      Code.eval_quoted(
+        quote do
+          require Ector.Query
+          Ector.Query.join(unquote(Macro.escape(query)), "carts", as: :cart)
+        end,
+        [],
+        __ENV__
+      )
+    end
+
+    assert_raise ArgumentError, ~r/compile time keyword list/, fn ->
+      Code.eval_quoted(
+        quote do
+          require Ector.Query
+          Ector.Query.join(unquote(Macro.escape(query)), :carts, :not_opts)
+        end,
+        [],
+        __ENV__
+      )
+    end
+  end
+
+  test "join/3 validates associations and Ector query sources" do
+    query = Ector.Query.from(u in User)
+
+    assert_raise ArgumentError, ~r/unknown Ector association/, fn ->
+      Ector.Query.join(query, :unknown, as: :cart)
+    end
+
+    assert_raise ArgumentError, ~r/expected an Ector schema module/, fn ->
+      PlainSchema
+      |> Ecto.Query.from()
+      |> Ector.Query.join(:carts, as: :cart)
+    end
+
+    assert_raise ArgumentError, ~r/expected an Ector query source/, fn ->
+      Ector.Query.join(%Ecto.Query{from: %Ecto.Query.FromExpr{source: "plain"}}, :carts,
+        as: :cart
+      )
+    end
+  end
+
+  test "join/3 resolves module atom binary named and invalid edge labels" do
+    assert_join_edge_label(
+      User |> Ector.Query.from() |> Ector.Query.join(:carts, as: :cart),
+      "HAS_CART"
+    )
+
+    assert_join_edge_label(
+      AtomThroughUser |> Ector.Query.from() |> Ector.Query.join(:legacy_carts, as: :cart),
+      "LEGACY_CART"
+    )
+
+    assert_join_edge_label(
+      BinaryThroughUser |> Ector.Query.from() |> Ector.Query.join(:legacy_carts, as: :cart),
+      "LEGACY_CART"
+    )
+
+    assert_join_edge_label(
+      NamedEdgeUser |> Ector.Query.from() |> Ector.Query.join(:line_items, as: :cart),
+      "LINE_ITEMS"
+    )
+
+    assert_raise ArgumentError, ~r/unsupported Ector edge label source/, fn ->
+      InvalidThroughUser
+      |> Ector.Query.from()
+      |> Ector.Query.join(:invalid_carts, as: :cart)
+    end
+  end
+
+  defp assert_join_edge_label(joined, edge_label) when is_binary(edge_label) do
+    assert [edge_join, _target_join] = joined.joins
+    assert Enum.any?(edge_join.on.params, &match?({^edge_label, _type}, &1))
   end
 
   defp query_with_rewritten_clause(kind, field) when is_atom(field) do

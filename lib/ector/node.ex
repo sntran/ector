@@ -32,14 +32,7 @@ defmodule Ector.Node do
     field(:properties, :map)
   end
 
-  @doc """
-  Derives the logical label stored for a node module in the shared `nodes` table.
-
-  ## Examples
-
-      iex> Ector.Node.label_for(MyApp.Checkout.Cart)
-      "Cart"
-  """
+  @doc false
   @spec label_for(module()) :: String.t()
   def label_for(module) when is_atom(module) do
     Ector.Schema.label_for(module, :node)

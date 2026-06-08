@@ -117,19 +117,33 @@ defmodule Ector.TranslatorTest do
     assert {sql, params} = expanded_translator_output(FakePostgresRepo, status: "archived")
     assert sql =~ "jsonb_set"
     assert sql =~ "to_jsonb"
-    assert [{%Ecto.Query.DynamicExpr{}, :any}, {["status"], {:array, :string}}, {"archived", :string}] = params
+
+    assert [
+             {%Ecto.Query.DynamicExpr{}, :any},
+             {["status"], {:array, :string}},
+             {"archived", :string}
+           ] = params
 
     assert {sql, params} = expanded_translator_output(FakePostgresRepo, count: 3)
     assert sql =~ ":integer"
-    assert [{%Ecto.Query.DynamicExpr{}, :any}, {["count"], {:array, :string}}, {3, :integer}] = params
+
+    assert [{%Ecto.Query.DynamicExpr{}, :any}, {["count"], {:array, :string}}, {3, :integer}] =
+             params
 
     assert {sql, params} = expanded_translator_output(FakePostgresRepo, ratio: 1.5)
     assert sql =~ ":float"
-    assert [{%Ecto.Query.DynamicExpr{}, :any}, {["ratio"], {:array, :string}}, {1.5, :float}] = params
+
+    assert [{%Ecto.Query.DynamicExpr{}, :any}, {["ratio"], {:array, :string}}, {1.5, :float}] =
+             params
 
     assert {sql, params} = expanded_translator_output(FakePostgresRepo, published: true)
     assert sql =~ ":boolean"
-    assert [{%Ecto.Query.DynamicExpr{}, :any}, {["published"], {:array, :string}}, {true, :boolean}] = params
+
+    assert [
+             {%Ecto.Query.DynamicExpr{}, :any},
+             {["published"], {:array, :string}},
+             {true, :boolean}
+           ] = params
 
     assert {sql, params} = expanded_translator_output(FakePostgresRepo, note: nil)
     assert sql =~ "'null'::jsonb"
@@ -137,23 +151,80 @@ defmodule Ector.TranslatorTest do
   end
 
   test "properties_update_expression/2 builds Postgres compound json_set fragments" do
-    assert {sql, params} = expanded_translator_output(FakePostgresRepo, metadata: %{"tier" => "pro"})
-    assert sql =~ "::text)::jsonb"
-    assert [{%Ecto.Query.DynamicExpr{}, :any}, {["metadata"], {:array, :string}}, {~s({"tier":"pro"}), :any}] = params
+    assert {sql, params} =
+             expanded_translator_output(FakePostgresRepo, metadata: %{"tier" => "pro"})
 
-    assert {sql, params} = expanded_translator_output(FakePostgresRepo, tags: ["archived", "reviewed"])
     assert sql =~ "::text)::jsonb"
-    assert [{%Ecto.Query.DynamicExpr{}, :any}, {["tags"], {:array, :string}}, {~s(["archived","reviewed"]), :any}] = params
+
+    assert [
+             {%Ecto.Query.DynamicExpr{}, :any},
+             {["metadata"], {:array, :string}},
+             {~s({"tier":"pro"}), :any}
+           ] = params
+
+    assert {sql, params} =
+             expanded_translator_output(FakePostgresRepo, tags: ["archived", "reviewed"])
+
+    assert sql =~ "::text)::jsonb"
+
+    assert [
+             {%Ecto.Query.DynamicExpr{}, :any},
+             {["tags"], {:array, :string}},
+             {~s(["archived","reviewed"]), :any}
+           ] = params
+  end
+
+  test "properties_update_expression/2 returns the properties field for empty generic updates" do
+    assert {sql, params} = expanded_translator_output(FakePostgresRepo, [])
+
+    assert sql =~ ".properties"
+    assert params == []
   end
 
   test "properties_update_expression/2 builds SQLite json_set fragments" do
-    assert {sql, params} = expanded_translator_output(FakeSQLiteRepo, metadata: %{"tier" => "pro"})
-    assert sql =~ "json_set"
-    assert [{%Ecto.Query.DynamicExpr{}, :any}, {"$.metadata", :any}, {~s({"tier":"pro"}), :any}] = params
+    assert {sql, params} =
+             expanded_translator_output(FakeSQLiteRepo, metadata: %{"tier" => "pro"})
 
-    assert {sql, params} = expanded_translator_output(FakeSQLiteRepo, tags: ["archived", "reviewed"])
     assert sql =~ "json_set"
-    assert [{%Ecto.Query.DynamicExpr{}, :any}, {"$.tags", :any}, {~s(["archived","reviewed"]), :any}] = params
+    refute sql =~ "%Ecto.Query.DynamicExpr{}"
+
+    assert [{"$.metadata", :any}, {~s({"tier":"pro"}), :any}] = params
+
+    assert {sql, params} =
+             expanded_translator_output(FakeSQLiteRepo, tags: ["archived", "reviewed"])
+
+    assert sql =~ "json_set"
+
+    assert [{"$.tags", :any}, {~s(["archived","reviewed"]), :any}] = params
+  end
+
+  test "properties_update_expression/2 returns the SQLite properties field for empty updates" do
+    assert {sql, params} = expanded_translator_output(FakeSQLiteRepo, [])
+
+    assert sql =~ ".properties"
+    assert params == []
+  end
+
+  test "properties_update_expression/2 builds one variadic SQLite json_set for multiple fields" do
+    assert {sql, params} =
+             expanded_translator_output(FakeSQLiteRepo,
+               status: "archived",
+               metadata: %{"tier" => "pro"},
+               published: true
+             )
+
+    assert sql =~ "json_set"
+    assert length(String.split(sql, "json(")) == 4
+    assert length(String.split(sql, "json_set")) == 2
+
+    assert [
+             {"$.status", :any},
+             {~s("archived"), :any},
+             {"$.metadata", :any},
+             {~s({"tier":"pro"}), :any},
+             {"$.published", :any},
+             {"true", :any}
+           ] = params
   end
 
   test "properties_update_expression/2 rejects unsupported repos" do
@@ -165,7 +236,8 @@ defmodule Ector.TranslatorTest do
   test "properties_update_expression/2 accepts string field names" do
     assert {sql, params} = expanded_translator_output(FakeSQLiteRepo, [{"status", "archived"}])
     assert sql =~ "json_set"
-    assert [{%Ecto.Query.DynamicExpr{}, :any}, {"$.status", :any}, {~s("archived"), :any}] = params
+
+    assert [{"$.status", :any}, {~s("archived"), :any}] = params
   end
 
   test "Postgres json_set/3 falls back to encoded jsonb for unmatched raw values" do
@@ -179,7 +251,65 @@ defmodule Ector.TranslatorTest do
     {sql, params} = expanded_expression_output(expression)
 
     assert sql =~ "::jsonb"
-    assert [{%Ecto.Query.DynamicExpr{}, :any}, {["opaque"], {:array, :string}}, {~s({"kind":"opaque"}), :any}] = params
+
+    assert [
+             {%Ecto.Query.DynamicExpr{}, :any},
+             {["opaque"], {:array, :string}},
+             {~s({"kind":"opaque"}), :any}
+           ] = params
+  end
+
+  test "SQLite json_set/3 remains available and appends to existing fragments" do
+    expression =
+      Ector.Translator.SQLite.json_set(
+        dynamic([row], row.properties),
+        ["metadata", "tier"],
+        %{encoded: ~s("pro")}
+      )
+
+    {sql, params} = expanded_expression_output(expression)
+
+    assert sql =~ "json_set"
+
+    assert [
+             {"$.metadata.tier", :any},
+             {~s("pro"), :any}
+           ] = params
+
+    expression =
+      expression
+      |> Ector.Translator.SQLite.json_set(["status"], %{encoded: ~s("archived")})
+
+    {sql, params} = expanded_expression_output(expression)
+
+    assert sql =~ "json_set"
+    assert length(String.split(sql, "json(")) == 3
+    assert length(String.split(sql, "json_set")) == 2
+
+    assert [
+             {"$.metadata.tier", :any},
+             {~s("pro"), :any},
+             {"$.status", :any},
+             {~s("archived"), :any}
+           ] = params
+  end
+
+  test "SQLite json_set/3 accepts raw accumulator ASTs" do
+    expression =
+      Ector.Translator.SQLite.json_set(
+        {{:., [], [{:&, [], [0]}, :properties]}, [], []},
+        ["status"],
+        %{encoded: ~s("archived")}
+      )
+
+    {sql, params} = expanded_expression_output(expression)
+
+    assert sql =~ "json_set"
+
+    assert [
+             {"$.status", :any},
+             {~s("archived"), :any}
+           ] = params
   end
 
   defp node_insert_target do

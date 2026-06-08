@@ -10,6 +10,12 @@ defmodule Ector.Repo do
   persists nested graph inserts through a transaction boundary, rewrites bulk
   `set` updates into adapter-native JSON mutations, and ensures deletes target
   the hidden `__id__` routing key instead of the caller's business identifier.
+
+  Ector queries intentionally carry the domain module in their source tuple
+  until this boundary. Just before execution, the wrapper swaps those sources to
+  `Ector.Node` or `Ector.Edge`, rewrites hidden `__id__` field reads to the
+  physical `id` column, and hydrates only full-row results. Explicit `select`
+  projections are returned unchanged.
   """
 
   import Ecto.Query
@@ -44,6 +50,8 @@ defmodule Ector.Repo do
                      one: 2,
                      insert: 1,
                      insert: 2,
+                     update: 1,
+                     update: 2,
                      delete: 1,
                      delete: 2,
                      delete_all: 1,
@@ -59,6 +67,9 @@ defmodule Ector.Repo do
 
       def insert(struct_or_changeset, opts \\ []),
         do: Ector.Repo.insert(__MODULE__, struct_or_changeset, opts, fn s, o -> super(s, o) end)
+
+      def update(struct_or_changeset, opts \\ []),
+        do: Ector.Repo.update(__MODULE__, struct_or_changeset, opts, fn s, o -> super(s, o) end)
 
       def delete(struct_or_changeset, opts \\ []),
         do: Ector.Repo.delete(__MODULE__, struct_or_changeset, opts, fn s, o -> super(s, o) end)
@@ -78,9 +89,12 @@ defmodule Ector.Repo do
   @spec all(module(), term(), Keyword.t(), (term(), Keyword.t() -> list())) :: list()
   def all(_repo, queryable, opts, fallback) when is_list(opts) and is_function(fallback, 2) do
     case storage_select_query(queryable) do
-      {:ok, module, query} ->
+      {:ok, module, query, :hydrate} ->
         fallback.(query, opts)
-        |> Enum.map(&hydrate(module, &1))
+        |> Enum.map(&hydrate_storage_row(module, &1))
+
+      {:ok, _module, query, :projection} ->
+        fallback.(query, opts)
 
       :error ->
         fallback.(queryable, opts)
@@ -91,11 +105,14 @@ defmodule Ector.Repo do
   @spec one(module(), term(), Keyword.t(), (term(), Keyword.t() -> term())) :: term()
   def one(_repo, queryable, opts, fallback) when is_list(opts) and is_function(fallback, 2) do
     case storage_select_query(queryable) do
-      {:ok, module, query} ->
+      {:ok, module, query, :hydrate} ->
         case fallback.(query, opts) do
           nil -> nil
-          row -> hydrate(module, row)
+          row -> hydrate_storage_row(module, row)
         end
+
+      {:ok, _module, query, :projection} ->
+        fallback.(query, opts)
 
       :error ->
         fallback.(queryable, opts)
@@ -113,6 +130,22 @@ defmodule Ector.Repo do
   end
 
   @doc false
+  @spec update(module(), term(), Keyword.t(), (term(), Keyword.t() -> term())) :: term()
+  def update(repo, struct_or_changeset, opts, fallback)
+      when is_atom(repo) and is_list(opts) and is_function(fallback, 2) do
+    case normalize_updateable(struct_or_changeset) do
+      {:ok, changeset, module, hidden_id} ->
+        update_hidden_id(repo, changeset, module, hidden_id, opts)
+
+      {:error, changeset} ->
+        {:error, changeset}
+
+      :error ->
+        fallback.(struct_or_changeset, opts)
+    end
+  end
+
+  @doc false
   @spec delete(module(), term(), Keyword.t(), (term(), Keyword.t() -> term())) :: term()
   def delete(repo, struct_or_changeset, opts, fallback)
       when is_atom(repo) and is_list(opts) and is_function(fallback, 2) do
@@ -125,7 +158,8 @@ defmodule Ector.Repo do
 
   @doc false
   @spec delete_all(module(), term(), Keyword.t(), (term(), Keyword.t() -> term())) :: term()
-  def delete_all(_repo, queryable, opts, fallback) when is_list(opts) and is_function(fallback, 2) do
+  def delete_all(_repo, queryable, opts, fallback)
+      when is_list(opts) and is_function(fallback, 2) do
     case storage_filter_query(queryable) do
       {:ok, _module, query} -> fallback.(query, opts)
       :error -> fallback.(queryable, opts)
@@ -133,7 +167,10 @@ defmodule Ector.Repo do
   end
 
   @doc false
-  @spec update_all(module(), term(), Keyword.t(), Keyword.t(), (term(), Keyword.t(), Keyword.t() -> term())) :: term()
+  @spec update_all(module(), term(), Keyword.t(), Keyword.t(), (term(),
+                                                                Keyword.t(),
+                                                                Keyword.t() ->
+                                                                  term())) :: term()
   def update_all(repo, queryable, updates, opts, fallback)
       when is_atom(repo) and is_list(updates) and is_list(opts) and is_function(fallback, 3) do
     case rewrite_update_all(repo, queryable, updates) do
@@ -142,22 +179,31 @@ defmodule Ector.Repo do
     end
   end
 
-  @spec storage_select_query(term()) :: {:ok, module(), Ecto.Query.t()} | :error
+  @spec storage_select_query(term()) ::
+          {:ok, module(), Ecto.Query.t(), :hydrate | :projection} | :error
+  defp storage_select_query(%Ecto.Query{} = query) do
+    with {:ok, module} <- ector_query_domain_module(query) do
+      hydration = if is_nil(query.select), do: :hydrate, else: :projection
+      {:ok, module, executable_ector_query(query), hydration}
+    end
+  end
+
   defp storage_select_query(queryable) do
     with {:ok, module} <- ector_queryable_module(queryable) do
       {:ok, module,
        from(row in storage_schema(module),
-         where: field(row, :label) == ^module.__ector_label__(),
-         select: %{
-           id: field(row, :id),
-           label: field(row, :label),
-           properties: field(row, :properties)
-         }
-       )}
+         where: field(row, :label) == ^module.__ector_label__()
+       ), :hydrate}
     end
   end
 
   @spec storage_filter_query(term()) :: {:ok, module(), Ecto.Query.t()} | :error
+  defp storage_filter_query(%Ecto.Query{} = query) do
+    with {:ok, module} <- ector_query_domain_module(query) do
+      {:ok, module, executable_ector_query(query)}
+    end
+  end
+
   defp storage_filter_query(queryable) do
     with {:ok, module} <- ector_queryable_module(queryable) do
       {:ok, module,
@@ -167,7 +213,7 @@ defmodule Ector.Repo do
 
   @spec normalize_insertable(term()) :: {:ok, Changeset.t()} | :error
   defp normalize_insertable(%Changeset{data: %{__struct__: module}} = changeset)
-      when is_atom(module) do
+       when is_atom(module) do
     if ector_schema_module?(module), do: {:ok, changeset}, else: :error
   end
 
@@ -176,7 +222,7 @@ defmodule Ector.Repo do
   @spec normalize_deleteable(term()) ::
           {:ok, struct(), module(), Ecto.UUID.t()} | {:error, Changeset.t()} | :error
   defp normalize_deleteable(%Changeset{data: %{__struct__: module}} = changeset)
-      when is_atom(module) do
+       when is_atom(module) do
     if ector_schema_module?(module) do
       changeset
       |> Changeset.apply_changes()
@@ -202,9 +248,38 @@ defmodule Ector.Repo do
 
   defp normalize_deleteable(_other), do: :error
 
+  @spec normalize_updateable(term()) ::
+          {:ok, Changeset.t(), module(), Ecto.UUID.t()} | {:error, Changeset.t()} | :error
+  defp normalize_updateable(%Changeset{data: %{__struct__: module}} = changeset)
+       when is_atom(module) do
+    cond do
+      not ector_schema_module?(module) ->
+        :error
+
+      module.__ector_kind__() != :node ->
+        {:error, Changeset.add_error(changeset, :base, "only node changesets can be updated")}
+
+      true ->
+        case Map.get(changeset.data, :__id__) do
+          hidden_id when is_binary(hidden_id) and hidden_id != "" ->
+            {:ok, changeset, module, hidden_id}
+
+          _ ->
+            {:error, Changeset.add_error(changeset, :__id__, "can't be blank")}
+        end
+    end
+  end
+
+  defp normalize_updateable(_other), do: :error
+
+  @spec hydrate_storage_row(module(), term()) :: term()
+  defp hydrate_storage_row(module, %Ector.Node{} = row), do: hydrate(module, row)
+  defp hydrate_storage_row(module, %Ector.Edge{} = row), do: hydrate(module, row)
+  defp hydrate_storage_row(_module, row), do: row
+
   @spec hydrate(module(), storage_row()) :: struct()
   defp hydrate(module, %{id: hidden_id, properties: properties})
-      when is_atom(module) and is_map(properties) do
+       when is_atom(module) and is_map(properties) do
     property_fields = module.__schema__(:fields) -- [:__id__]
 
     property_values =
@@ -253,7 +328,7 @@ defmodule Ector.Repo do
   @spec delete_hidden_id(module(), struct(), module(), Ecto.UUID.t(), Keyword.t()) ::
           {:ok, struct()} | {:error, Changeset.t()}
   defp delete_hidden_id(repo, struct, module, hidden_id, opts)
-      when is_atom(repo) and is_atom(module) and is_binary(hidden_id) and is_list(opts) do
+       when is_atom(repo) and is_atom(module) and is_binary(hidden_id) and is_list(opts) do
     query =
       from(row in storage_schema(module),
         where: field(row, :label) == ^module.__ector_label__() and field(row, :id) == ^hidden_id
@@ -263,6 +338,47 @@ defmodule Ector.Repo do
       {1, _} -> {:ok, struct}
       {0, _} -> {:error, Changeset.add_error(Changeset.change(struct), :__id__, "does not exist")}
     end
+  end
+
+  @spec update_hidden_id(module(), Changeset.t(), module(), Ecto.UUID.t(), Keyword.t()) ::
+          {:ok, struct()} | {:error, Changeset.t()}
+  defp update_hidden_id(repo, %Changeset{} = changeset, module, hidden_id, opts)
+       when is_atom(repo) and is_atom(module) and is_binary(hidden_id) and is_list(opts) do
+    cond do
+      not changeset.valid? ->
+        {:error, changeset}
+
+      true ->
+        set_updates = domain_set_updates(changeset)
+
+        if set_updates == [] do
+          {:ok, Changeset.apply_changes(changeset)}
+        else
+          query =
+            from(row in storage_schema(module),
+              where:
+                field(row, :label) == ^module.__ector_label__() and
+                  field(row, :id) == ^hidden_id
+            )
+
+          properties_update = Ector.Translator.properties_update_expression(repo, set_updates)
+
+          case repo.update_all(query, [set: [properties: properties_update]], storage_opts(opts)) do
+            {1, _} ->
+              {:ok, Changeset.apply_changes(changeset)}
+
+            {0, _} ->
+              {:error, Changeset.add_error(changeset, :__id__, "does not exist")}
+          end
+        end
+    end
+  end
+
+  @spec domain_set_updates(Changeset.t()) :: keyword()
+  defp domain_set_updates(%Changeset{changes: changes}) do
+    changes
+    |> Map.drop([:__id__, :__ector_edges__])
+    |> Enum.map(fn {field_name, value} -> {field_name, normalize_json(value)} end)
   end
 
   @spec rewrite_update_all(module(), term(), Keyword.t()) ::
@@ -431,6 +547,85 @@ defmodule Ector.Repo do
       :edges -> Ector.Edge
     end
   end
+
+  defp executable_ector_query(%Ecto.Query{} = query) do
+    query
+    |> rewrite_ector_query_sources()
+    |> rewrite_hidden_id_fields()
+  end
+
+  defp rewrite_ector_query_sources(%Ecto.Query{} = query) do
+    %{
+      query
+      | sources: nil,
+        from: rewrite_from_source(query.from),
+        joins: Enum.map(query.joins, &rewrite_join_source/1)
+    }
+  end
+
+  defp rewrite_from_source(%Ecto.Query.FromExpr{} = from) do
+    %{from | source: rewrite_storage_source(from.source)}
+  end
+
+  defp rewrite_join_source(%Ecto.Query.JoinExpr{} = join) do
+    %{join | source: rewrite_storage_source(join.source)}
+  end
+
+  defp rewrite_storage_source({source, module}) when is_atom(module) do
+    if ector_schema_module?(module) do
+      {source || storage_source(module), storage_schema(module)}
+    else
+      {source, module}
+    end
+  end
+
+  defp rewrite_storage_source(source), do: source
+
+  defp storage_source(module) when is_atom(module) do
+    module.__ector_table__() |> Atom.to_string()
+  end
+
+  defp rewrite_hidden_id_fields(%Ecto.Query{} = query) do
+    %{
+      query
+      | wheres: Enum.map(query.wheres, &rewrite_query_expr_hidden_id/1),
+        select: rewrite_query_expr_hidden_id(query.select),
+        order_bys: Enum.map(query.order_bys, &rewrite_query_expr_hidden_id/1),
+        group_bys: Enum.map(query.group_bys, &rewrite_query_expr_hidden_id/1),
+        havings: Enum.map(query.havings, &rewrite_query_expr_hidden_id/1),
+        distinct: rewrite_query_expr_hidden_id(query.distinct),
+        limit: rewrite_query_expr_hidden_id(query.limit),
+        offset: rewrite_query_expr_hidden_id(query.offset),
+        joins: Enum.map(query.joins, &rewrite_join_expr_hidden_id/1)
+    }
+  end
+
+  defp rewrite_join_expr_hidden_id(%Ecto.Query.JoinExpr{} = join) do
+    %{join | on: rewrite_query_expr_hidden_id(join.on)}
+  end
+
+  defp rewrite_query_expr_hidden_id(nil), do: nil
+
+  defp rewrite_query_expr_hidden_id(%{expr: expr} = query_expr) do
+    %{query_expr | expr: rewrite_hidden_id_ast(expr)}
+  end
+
+  defp rewrite_hidden_id_ast(ast) do
+    Macro.prewalk(ast, fn
+      {{:., dot_meta, [binding, :__id__]}, call_meta, []} ->
+        {{:., dot_meta, [binding, :id]}, call_meta, []}
+
+      other ->
+        other
+    end)
+  end
+
+  defp ector_query_domain_module(%Ecto.Query{from: %{source: {_source, module}}})
+       when is_atom(module) do
+    if ector_schema_module?(module), do: {:ok, module}, else: :error
+  end
+
+  defp ector_query_domain_module(_query), do: :error
 
   defp ector_queryable_module(module) when is_atom(module) do
     if ector_schema_module?(module), do: {:ok, module}, else: :error

@@ -34,14 +34,7 @@ defmodule Ector.Edge do
     field(:properties, :map)
   end
 
-  @doc """
-  Derives the logical label stored for an edge module in the shared `edges` table.
-
-  ## Examples
-
-      iex> Ector.Edge.label_for(MyApp.Checkout.HasCart)
-      "HAS_CART"
-  """
+  @doc false
   @spec label_for(module()) :: String.t()
   def label_for(module) when is_atom(module) do
     Ector.Schema.label_for(module, :edge)

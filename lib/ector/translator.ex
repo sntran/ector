@@ -16,22 +16,28 @@ defmodule Ector.Translator do
 
   @callback json_set(Macro.t(), [String.t()], json_value_payload()) :: Macro.t()
 
-  @doc """
-  Returns the adapter-specific JSON mutation expression for a bulk `set` update.
-  """
+  @doc false
   @spec properties_update_expression(module(), set_updates()) :: Macro.t()
   def properties_update_expression(repo, set_updates)
       when is_atom(repo) and is_list(set_updates) do
     adapter = module_for(repo)
 
-    Enum.reduce(normalized_updates(set_updates), dynamic([row], field(row, :properties)), fn {field_name, encoded, raw}, acc ->
-      adapter.json_set(acc, [field_name], %{encoded: encoded, raw: raw})
-    end)
+    reduce_json_set(adapter, normalized_updates(set_updates))
   end
 
-  @doc false
+  defp reduce_json_set(adapter, normalized_updates)
+       when is_atom(adapter) and is_list(normalized_updates) do
+    Enum.reduce(
+      normalized_updates,
+      dynamic([row], field(row, :properties)),
+      fn {field_name, encoded, raw}, acc ->
+        adapter.json_set(acc, [field_name], %{encoded: encoded, raw: raw})
+      end
+    )
+  end
+
   @spec module_for(module()) :: module()
-  def module_for(repo) when is_atom(repo) do
+  defp module_for(repo) when is_atom(repo) do
     case repo.__adapter__() do
       Ecto.Adapters.Postgres -> Ector.Translator.Postgres
       Ecto.Adapters.SQLite3 -> Ector.Translator.SQLite
@@ -47,9 +53,8 @@ defmodule Ector.Translator do
     |> IO.iodata_to_binary()
   end
 
-  @doc false
   @spec normalized_updates(set_updates()) :: [{String.t(), String.t(), term()}]
-  def normalized_updates(set_updates) when is_list(set_updates) do
+  defp normalized_updates(set_updates) when is_list(set_updates) do
     Enum.map(set_updates, fn
       {field_name, value} when is_atom(field_name) ->
         {Atom.to_string(field_name), encode_json!(value), value}

@@ -44,6 +44,35 @@ defmodule Ector.MigrationTest do
     end
   end
 
+  defmodule AdapterAwareIndexMigration do
+    use Ector.Migration
+    require Ector.Migration
+
+    def up do
+      create(
+        Ector.Migration.index(Ector.MigrationTest.IndexUser, [:email], name: :index_users_email)
+      )
+
+      create(
+        Ector.Migration.index(Ector.MigrationTest.IndexUser, [desc: :email],
+          name: :index_users_email_desc
+        )
+      )
+    end
+
+    def down do
+      drop_if_exists(
+        Ector.Migration.index(Ector.MigrationTest.IndexUser, [desc: :email],
+          name: :index_users_email_desc
+        )
+      )
+
+      drop_if_exists(
+        Ector.Migration.index(Ector.MigrationTest.IndexUser, [:email], name: :index_users_email)
+      )
+    end
+  end
+
   setup do
     Ector.TestRepo.drop_core_tables!()
     Ector.TestRepo.migrate!(@migration_version, CoreStorageMigration)
@@ -104,6 +133,24 @@ defmodule Ector.MigrationTest do
     assert index.where == "label = 'IndexUser'"
     assert index.prefix == "tenant_alpha"
     assert index.unique
+  end
+
+  test "index/3 writes adapter-matching JSON expression indexes during migration" do
+    version = @migration_version + 1
+    Ector.TestRepo.migrate!(version, AdapterAwareIndexMigration)
+
+    index_sql = Ector.TestRepo.index_sql("index_users_email")
+    desc_index_sql = Ector.TestRepo.index_sql("index_users_email_desc")
+
+    if Ector.TestRepo.sqlite?() do
+      assert index_sql =~ "json_extract(properties, '$.email')"
+      assert desc_index_sql =~ "json_extract(properties, '$.email') DESC"
+      refute index_sql =~ "->>"
+    else
+      assert index_sql =~ "properties"
+      assert index_sql =~ "email"
+      assert desc_index_sql =~ "email"
+    end
   end
 
   test "index/3 safely escapes quoted labels and quoted property keys" do

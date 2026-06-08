@@ -1,65 +1,13 @@
 defmodule Ector.Query do
-  @moduledoc ~S'''
+  @moduledoc ~S"""
   Ector-aware query macros built on top of `Ecto.Query`.
 
   `Ector.Query` keeps the caller-facing syntax of relational Ecto while routing
-  domain fields through the shared JSON storage shape. The source module remains
-  in the query source tuple for hydration, but the database source becomes the
-  physical Ector table.
-
-  ## Source translation
-
-      iex> module = Module.concat(__MODULE__, SourceDocUser)
-      iex> {:module, ^module, _, _} =
-      ...>   Module.create(module, quote do
-      ...>     use Ector.Node
-      ...>     schema do
-      ...>       field(:status, :string)
-      ...>     end
-      ...>   end, Macro.Env.location(__ENV__))
-      iex> {query, _binding} = Code.eval_quoted(quote do
-      ...>   require Ector.Query
-      ...>   Ector.Query.from(user in unquote(module))
-      ...> end)
-      iex> elem(query.from.source, 0)
-      "nodes"
-      iex> elem(query.from.source, 1) == module
-      true
-      iex> hd(query.wheres).params
-      [{"SourceDocUser", {0, :label}}]
-
-  ## Field redirection
-
-  A normal domain field access starts as ordinary Elixir AST:
-
-      c.status
-
-  Before Ecto sees the expression, Ector rewrites it to Ecto's native JSON path
-  form:
-
-      c.properties["status"]
-
-  Ecto then lowers that bracket access into its internal `json_extract_path`
-  query expression:
-
-      iex> module = Module.concat(__MODULE__, FilterDocUser)
-      iex> {:module, ^module, _, _} =
-      ...>   Module.create(module, quote do
-      ...>     use Ector.Node
-      ...>     schema do
-      ...>       field(:status, :string)
-      ...>     end
-      ...>   end, Macro.Env.location(__ENV__))
-      iex> {query, _binding} = Code.eval_quoted(quote do
-      ...>   require Ector.Query
-      ...>   value = "active"
-      ...>   Ector.Query.from(user in unquote(module))
-      ...>   |> Ector.Query.where([user], user.status == ^value)
-      ...> end)
-      iex> {:==, _, [{:json_extract_path, _, [_, ["status"]]}, {:^, [], [0]}]} = List.last(query.wheres).expr
-      iex> List.last(query.wheres).params
-      [{"active", :any}]
-  '''
+  domain fields through the shared JSON storage shape. The source tuple keeps
+  the caller's domain module until the repo boundary so Ector can hydrate rows
+  without a registry; `Ector.Repo` swaps that source to the physical `nodes` or
+  `edges` schema immediately before handing the query to Ecto's planner.
+  """
 
   @physical_fields [:__id__, :label, :source_id, :target_id]
   @rewritable_clauses [:where, :or_where, :select, :order_by, :group_by, :having, :or_having]
@@ -196,92 +144,36 @@ defmodule Ector.Query do
   end
 
   @doc """
-  Adds a join to a query.
+  Adds a graph association join to a query.
 
-  Logical `assoc/2` joins are expanded into two physical joins: a hidden join to
+  The association is expanded into two physical inner joins: a hidden join to
   the shared `edges` table and a final join to the target `nodes` table. The
   caller's `as:` alias is assigned only to the final target binding.
   """
-  defmacro join(query, qual, binding \\ [], expr, opts \\ [])
-
-  defmacro join(query, qual, binding, expr, opts) when is_list(binding) and is_list(opts) do
-    case parse_assoc_join(expr, opts) do
-      {:ok, source_binding, target_binding, association_name, target_alias} ->
-        build_assoc_join(
-          query,
-          qual,
-          binding,
-          source_binding,
-          target_binding,
-          association_name,
-          target_alias
-        )
-
-      :error ->
-        rewritten_opts = rewrite_join_opts(opts)
-
-        quote do
-          require Ecto.Query
-
-          Ecto.Query.join(
-            unquote(query),
-            unquote(qual),
-            unquote(binding),
-            unquote(expr),
-            unquote(rewritten_opts)
-          )
-        end
-    end
-  end
-
-  defmacro join(_query, _qual, binding, _expr, opts) when is_list(opts) do
-    raise ArgumentError,
-          "invalid binding passed to Ector.Query.join/5, should be a list of variables, got: #{Macro.to_string(binding)}"
-  end
-
-  defmacro join(_query, _qual, _binding, _expr, opts) do
-    raise ArgumentError,
-          "invalid opts passed to Ector.Query.join/5, should be a list, got: #{Macro.to_string(opts)}"
-  end
-
-  @doc false
-  @spec __association__!(Ecto.Queryable.t(), atom()) :: map()
-  def __association__!(queryable, association_name) when is_atom(association_name) do
-    query = Ecto.Queryable.to_query(queryable)
-    module = source_module!(query.from.source)
-
-    Enum.find(module.__ector_associations__(), &(&1.name == association_name)) ||
+  defmacro join(query, association_name, opts \\ []) do
+    unless is_atom(association_name) do
       raise ArgumentError,
-            "unknown Ector association #{inspect(association_name)} for #{inspect(module)}"
-  end
-
-  @doc false
-  @spec __edge_label__(map()) :: String.t()
-  def __edge_label__(%{opts: %{through: through}}) do
-    cond do
-      is_atom(through) and Code.ensure_loaded?(through) and
-          function_exported?(through, :__ector_label__, 0) ->
-        through.__ector_label__()
-
-      is_atom(through) ->
-        through |> Atom.to_string() |> String.upcase()
-
-      is_binary(through) ->
-        through |> Macro.underscore() |> String.upcase()
-
-      true ->
-        raise ArgumentError, "unsupported Ector edge label source: #{inspect(through)}"
+            "Ector.Query.join/3 expects a compile time atom association name, got: #{Macro.to_string(association_name)}"
     end
-  end
 
-  def __edge_label__(%{name: name}) when is_atom(name) do
-    name |> Atom.to_string() |> String.upcase()
-  end
+    unless Keyword.keyword?(opts) do
+      raise ArgumentError,
+            "Ector.Query.join/3 expects opts to be a compile time keyword list, got: #{Macro.to_string(opts)}"
+    end
 
-  @doc false
-  @spec __storage_source__(module()) :: {String.t(), module()}
-  def __storage_source__(module) when is_atom(module) do
-    {module.__ector_table__() |> Atom.to_string(), module}
+    target_alias = join_alias!(opts)
+    source_binding = Macro.unique_var(:ector_source, __MODULE__)
+    target_binding = Macro.unique_var(target_alias, __MODULE__)
+
+    build_assoc_join(
+      query,
+      :inner,
+      [source_binding],
+      source_binding,
+      target_binding,
+      association_name,
+      target_alias
+    )
   end
 
   defp build_assoc_join(
@@ -296,11 +188,12 @@ defmodule Ector.Query do
     edge_binding = Macro.unique_var(:ector_edge, __MODULE__)
     edge_alias = String.to_atom("__edge_#{target_alias}_#{System.unique_integer([:positive])}")
     association_var = Macro.unique_var(:ector_association, __MODULE__)
+    query_var = Macro.unique_var(:ector_query, __MODULE__)
     edge_label_var = Macro.unique_var(:ector_edge_label, __MODULE__)
     target_label_var = Macro.unique_var(:ector_target_label, __MODULE__)
     target_source_var = Macro.unique_var(:ector_target_source, __MODULE__)
     edge_source_var = Macro.unique_var(:ector_edge_source, __MODULE__)
-    second_binding = binding ++ [edge_binding]
+    second_binding = binding ++ [{:..., [], []}, edge_binding]
 
     outgoing_edge_on =
       edge_on_ast(edge_binding, source_binding, :source_id, :__id__, edge_label_var)
@@ -317,17 +210,58 @@ defmodule Ector.Query do
     quote do
       require Ecto.Query
 
-      unquote(association_var) =
-        Ector.Query.__association__!(unquote(query), unquote(association_name))
+      unquote(query_var) = unquote(query)
 
-      unquote(edge_label_var) = Ector.Query.__edge_label__(unquote(association_var))
+      unquote(association_var) =
+        case Ecto.Queryable.to_query(unquote(query_var)) do
+          %Ecto.Query{from: %{source: {_source, module}}} when is_atom(module) ->
+            if Code.ensure_loaded?(module) and function_exported?(module, :__ector_kind__, 0) and
+                 function_exported?(module, :__ector_label__, 0) and
+                 function_exported?(module, :__ector_table__, 0) do
+              Enum.find(module.__ector_associations__(), &(&1.name == unquote(association_name))) ||
+                raise ArgumentError,
+                      "unknown Ector association #{inspect(unquote(association_name))} for #{inspect(module)}"
+            else
+              raise ArgumentError, "expected an Ector schema module, got: #{inspect(module)}"
+            end
+
+          %Ecto.Query{from: %{source: source}} ->
+            raise ArgumentError, "expected an Ector query source, got: #{inspect(source)}"
+        end
+
+      unquote(edge_label_var) =
+        case unquote(association_var) do
+          %{opts: %{through: through}} ->
+            cond do
+              is_atom(through) and Code.ensure_loaded?(through) and
+                  function_exported?(through, :__ector_label__, 0) ->
+                through.__ector_label__()
+
+              is_atom(through) ->
+                through |> Atom.to_string() |> String.upcase()
+
+              is_binary(through) ->
+                through |> Macro.underscore() |> String.upcase()
+
+              true ->
+                raise ArgumentError, "unsupported Ector edge label source: #{inspect(through)}"
+            end
+
+          %{name: name} when is_atom(name) ->
+            name |> Atom.to_string() |> String.upcase()
+        end
+
       unquote(target_label_var) = unquote(association_var).target.__ector_label__()
-      unquote(target_source_var) = Ector.Query.__storage_source__(unquote(association_var).target)
+
+      unquote(target_source_var) =
+        {unquote(association_var).target.__ector_table__() |> Atom.to_string(),
+         unquote(association_var).target}
+
       unquote(edge_source_var) = {"edges", Ector.Edge}
 
       case unquote(association_var).direction do
         :outgoing ->
-          unquote(query)
+          unquote(query_var)
           |> Ecto.Query.join(
             unquote(qual),
             unquote(binding),
@@ -344,7 +278,7 @@ defmodule Ector.Query do
           )
 
         :incoming ->
-          unquote(query)
+          unquote(query_var)
           |> Ecto.Query.join(
             unquote(qual),
             unquote(binding),
@@ -367,7 +301,7 @@ defmodule Ector.Query do
     case Macro.expand(source, caller) do
       module when is_atom(module) ->
         if ector_schema_module?(module) do
-          source_tuple = Macro.escape(__storage_source__(module))
+          source_tuple = Macro.escape(storage_source_tuple(module))
           {:ok, {:in, meta, [binding, source_tuple]}, label_binding(binding), module}
         else
           :error
@@ -383,7 +317,7 @@ defmodule Ector.Query do
       module when is_atom(module) ->
         if ector_schema_module?(module) do
           binding = Macro.unique_var(:ector_source, __MODULE__)
-          source_tuple = Macro.escape(__storage_source__(module))
+          source_tuple = Macro.escape(storage_source_tuple(module))
           {:ok, {:in, [], [binding, source_tuple]}, binding, module}
         else
           :error
@@ -405,17 +339,6 @@ defmodule Ector.Query do
     {:field, [], [binding, field]}
   end
 
-  defp parse_assoc_join(
-         {:in, _meta,
-          [target_binding, {:assoc, _assoc_meta, [source_binding, association_name]}]},
-         opts
-       )
-       when is_atom(association_name) do
-    {:ok, source_binding, target_binding, association_name, join_alias!(opts)}
-  end
-
-  defp parse_assoc_join(_expr, _opts), do: :error
-
   defp join_alias!(opts) do
     case Keyword.fetch(opts, :as) do
       {:ok, alias_name} when is_atom(alias_name) ->
@@ -423,11 +346,11 @@ defmodule Ector.Query do
 
       {:ok, other} ->
         raise ArgumentError,
-              "Ector assoc joins require a compile time atom `as:` alias, got: #{Macro.to_string(other)}"
+              "Ector graph joins require a compile time atom `as:` alias, got: #{Macro.to_string(other)}"
 
       :error ->
         raise ArgumentError,
-              "Ector assoc joins require an `as:` alias for the target node binding"
+              "Ector graph joins require an `as:` alias for the target node binding"
     end
   end
 
@@ -468,13 +391,6 @@ defmodule Ector.Query do
   defp rewrite_query_opts(opts) do
     Enum.map(opts, fn
       {clause, expr} when clause in @rewritable_clauses -> {clause, rewrite_ast(expr)}
-      other -> other
-    end)
-  end
-
-  defp rewrite_join_opts(opts) do
-    Enum.map(opts, fn
-      {:on, expr} -> {:on, rewrite_ast(expr)}
       other -> other
     end)
   end
@@ -528,16 +444,8 @@ defmodule Ector.Query do
 
   defp rewrite_field_access(other), do: other
 
-  defp source_module!({_source, module}) when is_atom(module) do
-    if ector_schema_module?(module), do: module, else: raise_non_ector_source!(module)
-  end
-
-  defp source_module!(source) do
-    raise ArgumentError, "expected an Ector query source, got: #{inspect(source)}"
-  end
-
-  defp raise_non_ector_source!(module) do
-    raise ArgumentError, "expected an Ector schema module, got: #{inspect(module)}"
+  defp storage_source_tuple(module) when is_atom(module) do
+    {module.__ector_table__() |> Atom.to_string(), module}
   end
 
   defp ector_schema_module?(module) when is_atom(module) do

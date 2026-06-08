@@ -21,9 +21,9 @@ defmodule Ector.Schema do
   end
 
   @spec association_metadata(module(), atom(), atom(), module(), keyword()) :: map()
-  def association_metadata(owner, association_type, name, target, opts)
-      when is_atom(owner) and is_atom(association_type) and is_atom(name) and is_atom(target) and
-             is_list(opts) do
+  defp association_metadata(owner, association_type, name, target, opts)
+       when is_atom(owner) and is_atom(association_type) and is_atom(name) and is_atom(target) and
+              is_list(opts) do
     {cardinality, direction} = association_shape(association_type)
 
     %{
@@ -71,9 +71,16 @@ defmodule Ector.Schema do
     table = storage_table_for(kind)
 
     quote do
+      @doc false
       def __ector_kind__, do: @ector_kind
+
+      @doc false
       def __ector_label__, do: unquote(label)
+
+      @doc false
       def __ector_table__, do: unquote(table)
+
+      @doc false
       def __ector_associations__, do: unquote(Macro.escape(associations))
 
       def changeset(struct \\ %__MODULE__{}, attrs)
@@ -127,6 +134,7 @@ defmodule Ector.Schema do
         {struct_fields, bags_of_clauses} = Ecto.Schema.__schema__(__MODULE__)
         defstruct struct_fields
 
+        @doc false
         def __changeset__ do
           %{unquote_splicing(Macro.escape(@ecto_changeset_fields))}
         end

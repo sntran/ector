@@ -152,20 +152,40 @@ defmodule Ector.Migration do
         table = module.__ector_table__() |> validate_table_target()
         columns = validate_index_columns(columns)
         opts = validate_index_opts(opts)
-        rewritten_columns = Enum.map(columns, &rewrite_index_column/1)
 
         merged_opts =
           Keyword.put(opts, :where, merge_label_constraint(label, Keyword.get(opts, :where)))
 
         quote bind_quoted: [
                 table: table,
-                rewritten_columns: rewritten_columns,
+                columns: columns,
                 merged_opts: merged_opts
               ] do
           require Ecto.Migration
+
+          rewritten_columns =
+            Ector.Migration.__rewrite_index_columns__(
+              columns,
+              Ector.Migration.__repo_adapter__()
+            )
+
           Ecto.Migration.index(table, rewritten_columns, merged_opts)
         end
     end
+  end
+
+  @doc false
+  @spec __repo_adapter__() :: module()
+  def __repo_adapter__ do
+    Ecto.Migration.repo().__adapter__()
+  rescue
+    _exception -> Ecto.Adapters.Postgres
+  end
+
+  @doc false
+  @spec __rewrite_index_columns__([term()], module()) :: [term()]
+  def __rewrite_index_columns__(columns, adapter) when is_list(columns) and is_atom(adapter) do
+    Enum.map(columns, &rewrite_index_column(&1, adapter))
   end
 
   defp postgres_gin_index_sql(prefix) do
@@ -184,8 +204,8 @@ defmodule Ector.Migration do
     end
   end
 
-  defp rewrite_index_column({direction, column}) when direction in [:asc, :desc] do
-    expression = rewrite_index_column(column)
+  defp rewrite_index_column({direction, column}, adapter) when direction in [:asc, :desc] do
+    expression = rewrite_index_column(column, adapter)
 
     case expression do
       column when is_atom(column) -> [{direction, column}]
@@ -193,16 +213,20 @@ defmodule Ector.Migration do
     end
   end
 
-  defp rewrite_index_column(:id), do: :id
-  defp rewrite_index_column(:label), do: :label
-  defp rewrite_index_column(:source_id), do: :source_id
-  defp rewrite_index_column(:target_id), do: :target_id
-  defp rewrite_index_column(:__id__), do: :id
+  defp rewrite_index_column(:id, _adapter), do: :id
+  defp rewrite_index_column(:label, _adapter), do: :label
+  defp rewrite_index_column(:source_id, _adapter), do: :source_id
+  defp rewrite_index_column(:target_id, _adapter), do: :target_id
+  defp rewrite_index_column(:__id__, _adapter), do: :id
 
-  defp rewrite_index_column(column) when is_atom(column),
+  defp rewrite_index_column(column, Ecto.Adapters.SQLite3) when is_atom(column) do
+    "json_extract(properties, '$.#{escape_sql_string(column)}')"
+  end
+
+  defp rewrite_index_column(column, _adapter) when is_atom(column),
     do: "(properties->>'#{escape_sql_string(column)}')"
 
-  defp rewrite_index_column(column) when is_binary(column), do: column
+  defp rewrite_index_column(column, _adapter) when is_binary(column), do: column
 
   defp merge_label_constraint(label, nil), do: "label = '#{escape_sql_string(label)}'"
 
