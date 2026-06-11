@@ -1,0 +1,18 @@
+<.live_component
+  module={StoreWeb.HeaderComponent}
+  id="site-header"
+  cart_id={assigns[:cart_id] || Store.Checkout.default_cart_id()}
+  cart_summary={assigns[:cart_summary] || assigns[:summary]}
+  version={assigns[:cart_version] || 0}
+/>
+<div class="flash-stack">
+  <p :if={Phoenix.Flash.get(@flash, :info)} class="flash flash-info">
+    {Phoenix.Flash.get(@flash, :info)}
+  </p>
+  <p :if={Phoenix.Flash.get(@flash, :error)} class="flash flash-error">
+    {Phoenix.Flash.get(@flash, :error)}
+  </p>
+</div>
+<main class="page-shell">
+  {@inner_content}
+</main>

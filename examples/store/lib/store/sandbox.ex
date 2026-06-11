@@ -7,31 +7,27 @@ defmodule Store.Sandbox do
   default SQLite files or a PostgreSQL database selected with `STORE_ADAPTER`.
   """
 
-  @relational_tables ~w(store_cart_items store_carts store_customers store_products)
   @ector_tables ~w(edges nodes)
 
   @doc "Starts the application repositories, drops owned tables, and runs migrations."
   @spec reset!() :: :ok
   def reset! do
     start_repos!()
-    drop!(Store.RelationalRepo, @relational_tables)
-    drop!(Store.EctorRepo, @ector_tables)
+    drop!(Store.Repo, @ector_tables)
     migrate!()
   end
 
   @doc "Runs all pending migrations for both repositories."
   @spec migrate!() :: :ok
   def migrate! do
-    migrate_repo!(Store.RelationalRepo)
-    migrate_repo!(Store.EctorRepo)
+    migrate_repo!(Store.Repo)
     :ok
   end
 
   @doc "Drops all tables owned by the example repositories."
   @spec drop!() :: :ok
   def drop! do
-    drop!(Store.RelationalRepo, @relational_tables)
-    drop!(Store.EctorRepo, @ector_tables)
+    drop!(Store.Repo, @ector_tables)
     :ok
   end
 

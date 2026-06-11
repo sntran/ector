@@ -5,11 +5,21 @@ defmodule Store.Application do
 
   @impl true
   def start(_type, _args) do
-    children = [Store.RelationalRepo, Store.EctorRepo]
+    prepare_sqlite_database!(Store.Repo)
 
-    Enum.each(children, &prepare_sqlite_database!/1)
+    children = [
+      Store.Repo,
+      {Phoenix.PubSub, name: Store.PubSub},
+      StoreWeb.Endpoint
+    ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: Store.Supervisor)
+  end
+
+  @impl true
+  def config_change(changed, _new, removed) do
+    StoreWeb.Endpoint.config_change(changed, removed)
+    :ok
   end
 
   defp prepare_sqlite_database!(repo) do

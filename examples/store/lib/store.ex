@@ -1,7 +1,6 @@
 defmodule Store do
   @moduledoc """
-  Standalone e-commerce showcase for comparing relational Ecto schemas with
-  Ector's graph-backed dynamic schema engine.
+  Standalone zero-migration storefront backed by Ector's graph storage engine.
 
   The project runs on SQLite by default. Set `STORE_ADAPTER=postgres` before
   compilation to exercise the same modules against PostgreSQL.

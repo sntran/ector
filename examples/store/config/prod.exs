@@ -1,15 +1,16 @@
 import Config
 
-config :store,
-       Store.RelationalRepo,
-       url: System.fetch_env!("STORE_RELATIONAL_DATABASE_URL"),
-       pool_size: String.to_integer(System.get_env("STORE_POOL_SIZE") || "10"),
-       migration_source: "store_relational_schema_migrations",
-       priv: "priv/relational_repo"
+config :store, StoreWeb.Endpoint,
+  http: [
+    ip: {0, 0, 0, 0},
+    port: String.to_integer(System.get_env("PORT") || "4000")
+  ],
+  secret_key_base: System.fetch_env!("SECRET_KEY_BASE"),
+  server: true
 
 config :store,
-       Store.EctorRepo,
-       url: System.fetch_env!("STORE_ECTOR_DATABASE_URL"),
+       Store.Repo,
+       url: System.fetch_env!("STORE_DATABASE_URL"),
        pool_size: String.to_integer(System.get_env("STORE_POOL_SIZE") || "10"),
-       migration_source: "store_ector_schema_migrations",
-       priv: "priv/ector_repo"
+       migration_source: "store_schema_migrations",
+       priv: "priv/repo"

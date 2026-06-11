@@ -1,10 +1,12 @@
 Mix.Task.run("app.start")
 
 alias Store.Catalog
-alias Store.Ector, as: EctorStore
-alias Store.Relational, as: RelationalStore
+alias Store.Catalog.{Offer, Product}
+alias Store.Checkout
+alias Store.Checkout.{Cart, CartItem}
+alias Store.Storage
 
-n = String.to_integer(System.get_env("BENCH_N") || "500")
+n = String.to_integer(System.get_env("BENCH_N") || "1000")
 adapter = Store.adapter_name()
 
 parse_seconds = fn env, default ->
@@ -20,105 +22,120 @@ bench_opts = [
   print: [fast_warning: false]
 ]
 
-IO.puts("== Store benchmark: #{adapter} adapter, #{n} synthetic products ==")
+product_offer_label = Storage.edge_label!(Product, :offers)
+cart_item_label = Storage.edge_label!(Cart, :items)
+offer_item_label = Storage.edge_label!(Offer, :cart_items)
 
-IO.puts(
-  "Run again with STORE_ADAPTER=postgres and STORE_DATABASE_URL=... to collect PostgreSQL results."
-)
+build_rows = fn count ->
+  product_offer_pairs =
+    Enum.map(1..count, fn i ->
+      product_storage_id = Storage.uuidv7()
+      offer_storage_id = Storage.uuidv7()
+      product_id = "bench-product-#{i}"
+      product_name = "Bench Product #{i}"
+      product_description = "Synthetic storefront product #{i}"
 
-product_attrs = fn i ->
-  %{
-    id: "bench-p#{i}",
-    sku: "BENCH-#{i}",
-    name: "Bench Product #{i}",
-    category: Enum.at(~w(books office tools), rem(i, 3)),
-    price: i / 10,
-    status: if(rem(i, 5) == 0, do: "archived", else: "active")
-  }
+      %{
+        product_storage_id: product_storage_id,
+        offer_storage_id: offer_storage_id,
+        product:
+          Storage.node_row(
+            Product,
+            %{
+              id: product_id,
+              name: product_name,
+              description: product_description,
+              images: ["https://example.com/products/#{i}.png"]
+            },
+            product_storage_id
+          ),
+        offer:
+          Storage.node_row(
+            Offer,
+            %{
+              id: "bench-offer-#{i}",
+              product_id: product_id,
+              offered_by: Enum.at(["Northstar Supply", "Vector Market"], rem(i, 2)),
+              price: 1_000 + i,
+              quantity: 10 + rem(i, 50),
+              product_name: product_name,
+              product_description: product_description
+            },
+            offer_storage_id
+          )
+      }
+    end)
+
+  cart_storage_id = Storage.uuidv7()
+
+  cart =
+    Storage.node_row(Cart, %{id: "bench-cart", status: "active"}, cart_storage_id)
+
+  cart_items =
+    product_offer_pairs
+    |> Enum.take(3)
+    |> Enum.with_index(1)
+    |> Enum.map(fn {pair, i} ->
+      item_storage_id = Storage.uuidv7()
+
+      %{
+        storage_id: item_storage_id,
+        offer_storage_id: pair.offer_storage_id,
+        row:
+          Storage.node_row(
+            CartItem,
+            %{id: "bench-item-#{i}", quantity: i, price_at_addition: 1_000 + i},
+            item_storage_id
+          )
+      }
+    end)
+
+  nodes =
+    Enum.flat_map(product_offer_pairs, &[&1.product, &1.offer]) ++
+      [cart | Enum.map(cart_items, & &1.row)]
+
+  edges =
+    Enum.map(product_offer_pairs, fn pair ->
+      Storage.edge_row(product_offer_label, pair.product_storage_id, pair.offer_storage_id)
+    end) ++
+      Enum.flat_map(cart_items, fn item ->
+        [
+          Storage.edge_row(cart_item_label, cart_storage_id, item.storage_id),
+          Storage.edge_row(offer_item_label, item.offer_storage_id, item.storage_id)
+        ]
+      end)
+
+  {nodes, edges}
 end
 
-seed_relational_products = fn ->
-  Enum.each(1..n, fn i ->
-    {:ok, _product} =
-      Store.RelationalRepo.insert(
-        RelationalStore.Product.changeset(%RelationalStore.Product{}, product_attrs.(i))
-      )
-  end)
+seed = fn count ->
+  Store.Sandbox.reset!()
+  {nodes, edges} = build_rows.(count)
+  Storage.insert_nodes!(nodes)
+  Storage.insert_edges!(edges)
+  :ok
 end
 
-seed_ector_products = fn ->
-  Enum.each(1..n, fn i ->
-    {:ok, _product} =
-      Store.EctorRepo.insert(
-        EctorStore.Product.changeset(%EctorStore.Product{}, product_attrs.(i))
-      )
-  end)
-end
+IO.puts("== Store benchmark: #{adapter} adapter, #{n} Ector-backed offers ==")
 
 Benchee.run(
   %{
-    "insert products (relational)" =>
-      {fn _input -> seed_relational_products.() end,
+    "batch seed nodes and edges" =>
+      {fn _input ->
+         {nodes, edges} = build_rows.(n)
+         Storage.insert_nodes!(nodes)
+         Storage.insert_edges!(edges)
+       end,
        before_each: fn _input ->
          Store.Sandbox.reset!()
          :ok
        end},
-    "insert products (ector graph)" =>
-      {fn _input -> seed_ector_products.() end,
-       before_each: fn _input ->
-         Store.Sandbox.reset!()
-         :ok
-       end}
-  },
-  bench_opts
-)
-
-query_setup = fn _input ->
-  Store.Sandbox.reset!()
-  seed_relational_products.()
-  seed_ector_products.()
-  :ok
-end
-
-Benchee.run(
-  %{
-    "complex filter (relational b-tree)" =>
-      {fn _input -> Catalog.active_book_names_relational(Store.RelationalRepo) end,
-       before_each: query_setup},
-    "complex filter (ector partial json index)" =>
-      {fn _input -> Catalog.active_book_names_ector(Store.EctorRepo) end,
-       before_each: query_setup}
-  },
-  bench_opts
-)
-
-association_setup = fn _input ->
-  Store.Sandbox.reset!()
-  Catalog.seed_relational_cart(Store.RelationalRepo)
-  {:ok, _customer} = Catalog.seed_ector_cart(Store.EctorRepo)
-  :ok
-end
-
-Benchee.run(
-  %{
-    "association load (relational preload)" =>
-      {fn _input -> Catalog.load_relational_cart(Store.RelationalRepo) end,
-       before_each: association_setup},
-    "association load (ector graph join)" =>
-      {fn _input -> Catalog.load_ector_cart_items(Store.EctorRepo) end,
-       before_each: association_setup}
-  },
-  bench_opts
-)
-
-Benchee.run(
-  %{
-    "filtered bulk update (relational column)" =>
-      {fn _input -> Catalog.archive_active_books_relational(Store.RelationalRepo) end,
-       before_each: query_setup},
-    "filtered bulk update (ector json mutation)" =>
-      {fn _input -> Catalog.archive_active_books_ector(Store.EctorRepo) end,
-       before_each: query_setup}
+    "offer listing page" =>
+      {fn _input -> Catalog.list_offers(limit: 50, search: "product") end,
+       before_each: fn _input -> seed.(n) end},
+    "cart summary graph join" =>
+      {fn _input -> Checkout.get_cart_summary("bench-cart") end,
+       before_each: fn _input -> seed.(n) end}
   },
   bench_opts
 )

@@ -9,6 +9,14 @@ common = [
   log: false
 ]
 
+config :store, StoreWeb.Endpoint,
+  http: [ip: {127, 0, 0, 1}, port: String.to_integer(System.get_env("PORT") || "4000")],
+  check_origin: false,
+  code_reloader: false,
+  debug_errors: true,
+  secret_key_base:
+    "store_dev_secret_key_base_64_bytes_minimum_for_signed_live_sessions_1234567890"
+
 if postgres? do
   database_url =
     System.get_env("STORE_DATABASE_URL") ||
@@ -16,39 +24,21 @@ if postgres? do
       raise "set STORE_DATABASE_URL or DATABASE_URL when STORE_ADAPTER=postgres"
 
   config :store,
-         Store.RelationalRepo,
+         Store.Repo,
          Keyword.merge(common,
-           url: System.get_env("STORE_RELATIONAL_DATABASE_URL") || database_url,
-           migration_source: "store_relational_schema_migrations",
-           priv: "priv/relational_repo"
-         )
-
-  config :store,
-         Store.EctorRepo,
-         Keyword.merge(common,
-           url: System.get_env("STORE_ECTOR_DATABASE_URL") || database_url,
-           migration_source: "store_ector_schema_migrations",
-           priv: "priv/ector_repo"
+           url: database_url,
+           migration_source: "store_schema_migrations",
+           priv: "priv/repo"
          )
 else
   tmp = Path.expand("../tmp", __DIR__)
 
   config :store,
-         Store.RelationalRepo,
+         Store.Repo,
          Keyword.merge(common,
-           database: Path.join(tmp, "store_relational_dev.sqlite3"),
-           migration_source: "store_relational_schema_migrations",
-           priv: "priv/relational_repo",
-           journal_mode: :wal,
-           busy_timeout: 5_000
-         )
-
-  config :store,
-         Store.EctorRepo,
-         Keyword.merge(common,
-           database: Path.join(tmp, "store_ector_dev.sqlite3"),
-           migration_source: "store_ector_schema_migrations",
-           priv: "priv/ector_repo",
+           database: Path.join(tmp, "store_dev.sqlite3"),
+           migration_source: "store_schema_migrations",
+           priv: "priv/repo",
            journal_mode: :wal,
            busy_timeout: 5_000
          )
