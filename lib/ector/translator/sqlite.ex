@@ -11,21 +11,51 @@ defmodule Ector.Translator.SQLite do
   def json_set(acc, path, %{encoded: encoded_value}) do
     json_path = "$." <> Enum.join(path, ".")
 
-    append_json_set(acc, json_path, encoded_value)
+    append_json_mutation(
+      acc,
+      [{json_path, :any}, {encoded_value, :any}],
+      &append_json_set_expr/2
+    )
   end
 
-  defp append_json_set(%Ecto.Query.DynamicExpr{} = acc, json_path, encoded_value) do
+  @doc false
+  @impl true
+  @spec json_inc(Macro.t(), [String.t()], number()) :: Macro.t()
+  def json_inc(acc, path, amount) when is_number(amount) do
+    json_path = "$." <> Enum.join(path, ".")
+
+    append_json_mutation(
+      acc,
+      [{json_path, :any}, {amount, :any}],
+      &append_json_inc_expr/2
+    )
+  end
+
+  @doc false
+  @impl true
+  @spec json_push(Macro.t(), [String.t()], Ector.Translator.json_value_payload()) :: Macro.t()
+  def json_push(acc, path, %{encoded: encoded_value}) do
+    json_path = "$." <> Enum.join(path, ".")
+
+    append_json_mutation(
+      acc,
+      [{json_path, :any}, {encoded_value, :any}],
+      &append_json_push_expr/2
+    )
+  end
+
+  defp append_json_mutation(%Ecto.Query.DynamicExpr{} = acc, new_params, expr_builder) do
     %Ecto.Query.DynamicExpr{
       binding: acc.binding,
       file: __ENV__.file,
       line: __ENV__.line,
       fun: fn query ->
-        {ast, params, subqueries, aliases} = acc.fun.(query)
-        path_param_index = length(params)
+        {ast, existing_params, subqueries, aliases} = acc.fun.(query)
+        path_param_index = length(existing_params)
 
         {
-          append_json_set_expr(ast, path_param_index),
-          params ++ [{json_path, :any}, {encoded_value, :any}],
+          expr_builder.(ast, path_param_index),
+          existing_params ++ new_params,
           subqueries,
           aliases
         }
@@ -33,13 +63,13 @@ defmodule Ector.Translator.SQLite do
     }
   end
 
-  defp append_json_set(ast, json_path, encoded_value) do
+  defp append_json_mutation(ast, params, expr_builder) do
     %Ecto.Query.DynamicExpr{
       binding: [{:row, [], nil}],
       file: __ENV__.file,
       line: __ENV__.line,
       fun: fn _query ->
-        {append_json_set_expr(ast, 0), [{json_path, :any}, {encoded_value, :any}], [], %{}}
+        {expr_builder.(ast, 0), params, [], %{}}
       end
     }
   end
@@ -58,15 +88,55 @@ defmodule Ector.Translator.SQLite do
     {:fragment, [], [raw: "json_set(", expr: ast] ++ json_set_tail(path_index) ++ [raw: ")"]}
   end
 
+  defp append_json_inc_expr(ast, path_index) do
+    amount_index = path_index + 1
+
+    {:fragment, [],
+     [
+       raw: "json_set(",
+       expr: ast,
+       raw: ", ",
+       expr: param(path_index),
+       raw: ", json(CAST((COALESCE(CAST(json_extract(",
+       expr: ast,
+       raw: ", ",
+       expr: param(path_index),
+       raw: ") AS NUMERIC), 0) + ",
+       expr: param(amount_index),
+       raw: ") AS TEXT)))"
+     ]}
+  end
+
+  defp append_json_push_expr(ast, path_index) do
+    value_index = path_index + 1
+
+    {:fragment, [],
+     [
+       raw: "json_set(",
+       expr: ast,
+       raw: ", ",
+       expr: param(path_index),
+       raw: ", json_insert(COALESCE(json_extract(",
+       expr: ast,
+       raw: ", ",
+       expr: param(path_index),
+       raw: "), '[]'), '$[#]', json(",
+       expr: param(value_index),
+       raw: ")))"
+     ]}
+  end
+
   defp json_set_tail(path_index) do
     value_index = path_index + 1
 
     [
       raw: ", ",
-      expr: {:^, [], [path_index]},
+      expr: param(path_index),
       raw: ", json(",
-      expr: {:^, [], [value_index]},
+      expr: param(value_index),
       raw: ")"
     ]
   end
+
+  defp param(index), do: {:^, [], [index]}
 end

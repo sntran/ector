@@ -162,18 +162,50 @@ defmodule Ector.Query do
     end
 
     target_alias = join_alias!(opts)
+    source_alias = join_source_alias!(opts)
     source_binding = Macro.unique_var(:ector_source, __MODULE__)
     target_binding = Macro.unique_var(target_alias, __MODULE__)
+
+    source_binding_list =
+      if is_nil(source_alias), do: [source_binding], else: [{source_alias, source_binding}]
 
     build_assoc_join(
       query,
       :inner,
-      [source_binding],
+      source_binding_list,
       source_binding,
       target_binding,
       association_name,
-      target_alias
+      target_alias,
+      source_alias
     )
+  end
+
+  @doc false
+  @spec __join_source_module__(Ecto.Queryable.t(), atom() | nil) :: module()
+  def __join_source_module__(queryable, source_alias) do
+    query = Ecto.Queryable.to_query(queryable)
+
+    case join_source(query, source_alias) do
+      {:ok, {_source, module}} when is_atom(module) ->
+        if ector_schema_module?(module) do
+          module
+        else
+          raise ArgumentError, "expected an Ector schema module, got: #{inspect(module)}"
+        end
+
+      {:ok, source} ->
+        raise ArgumentError, "expected an Ector query source, got: #{inspect(source)}"
+
+      :error ->
+        if is_nil(source_alias) do
+          raise ArgumentError,
+                "expected an Ector query source, got: #{inspect(query.from.source)}"
+        else
+          raise ArgumentError,
+                "unknown Ector join source alias #{inspect(source_alias)} in query"
+        end
+    end
   end
 
   defp build_assoc_join(
@@ -183,17 +215,25 @@ defmodule Ector.Query do
          source_binding,
          target_binding,
          association_name,
-         target_alias
+         target_alias,
+         source_alias
        ) do
     edge_binding = Macro.unique_var(:ector_edge, __MODULE__)
     edge_alias = String.to_atom("__edge_#{target_alias}_#{System.unique_integer([:positive])}")
     association_var = Macro.unique_var(:ector_association, __MODULE__)
     query_var = Macro.unique_var(:ector_query, __MODULE__)
+    source_module_var = Macro.unique_var(:ector_source_module, __MODULE__)
     edge_label_var = Macro.unique_var(:ector_edge_label, __MODULE__)
     target_label_var = Macro.unique_var(:ector_target_label, __MODULE__)
     target_source_var = Macro.unique_var(:ector_target_source, __MODULE__)
     edge_source_var = Macro.unique_var(:ector_edge_source, __MODULE__)
-    second_binding = binding ++ [{:..., [], []}, edge_binding]
+
+    second_binding =
+      if is_nil(source_alias) do
+        binding ++ [{:..., [], []}, edge_binding]
+      else
+        [{:..., [], []}, edge_binding]
+      end
 
     outgoing_edge_on =
       edge_on_ast(edge_binding, source_binding, :source_id, :__id__, edge_label_var)
@@ -212,22 +252,16 @@ defmodule Ector.Query do
 
       unquote(query_var) = unquote(query)
 
-      unquote(association_var) =
-        case Ecto.Queryable.to_query(unquote(query_var)) do
-          %Ecto.Query{from: %{source: {_source, module}}} when is_atom(module) ->
-            if Code.ensure_loaded?(module) and function_exported?(module, :__ector_kind__, 0) and
-                 function_exported?(module, :__ector_label__, 0) and
-                 function_exported?(module, :__ector_table__, 0) do
-              Enum.find(module.__ector_associations__(), &(&1.name == unquote(association_name))) ||
-                raise ArgumentError,
-                      "unknown Ector association #{inspect(unquote(association_name))} for #{inspect(module)}"
-            else
-              raise ArgumentError, "expected an Ector schema module, got: #{inspect(module)}"
-            end
+      unquote(source_module_var) =
+        Ector.Query.__join_source_module__(unquote(query_var), unquote(source_alias))
 
-          %Ecto.Query{from: %{source: source}} ->
-            raise ArgumentError, "expected an Ector query source, got: #{inspect(source)}"
-        end
+      unquote(association_var) =
+        Enum.find(
+          unquote(source_module_var).__ector_associations__(),
+          &(&1.name == unquote(association_name))
+        ) ||
+          raise ArgumentError,
+                "unknown Ector association #{inspect(unquote(association_name))} for #{inspect(unquote(source_module_var))}"
 
       unquote(edge_label_var) =
         case unquote(association_var) do
@@ -351,6 +385,42 @@ defmodule Ector.Query do
       :error ->
         raise ArgumentError,
               "Ector graph joins require an `as:` alias for the target node binding"
+    end
+  end
+
+  defp join_source_alias!(opts) do
+    case Keyword.fetch(opts, :from) do
+      {:ok, alias_name} when is_atom(alias_name) ->
+        alias_name
+
+      {:ok, other} ->
+        raise ArgumentError,
+              "Ector graph joins require `from:` to be a compile time atom alias, got: #{Macro.to_string(other)}"
+
+      :error ->
+        nil
+    end
+  end
+
+  defp join_source(%Ecto.Query{from: %{source: source}}, nil), do: {:ok, source}
+
+  defp join_source(%Ecto.Query{} = query, source_alias) when is_atom(source_alias) do
+    aliases = query.aliases || %{}
+
+    with {:ok, index} <- Map.fetch(aliases, source_alias),
+         {:ok, source} <- source_at_binding(query, index) do
+      {:ok, source}
+    else
+      _other -> :error
+    end
+  end
+
+  defp source_at_binding(%Ecto.Query{from: %{source: source}}, 0), do: {:ok, source}
+
+  defp source_at_binding(%Ecto.Query{joins: joins}, index) when is_integer(index) and index > 0 do
+    case Enum.at(joins, index - 1) do
+      %Ecto.Query.JoinExpr{source: source} -> {:ok, source}
+      _other -> :error
     end
   end
 

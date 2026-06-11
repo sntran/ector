@@ -20,6 +20,7 @@ defmodule Ector.TranslatorTest do
     use Ector.Node
 
     schema do
+      field(:count, :integer, default: 0)
       field(:status, :string)
       field(:metadata, :map, default: %{})
       field(:tags, {:array, :string}, default: [])
@@ -77,6 +78,7 @@ defmodule Ector.TranslatorTest do
                  properties:
                    encoded_properties(%{
                      "id" => "user-1",
+                     "count" => 5,
                      "status" => "draft",
                      "metadata" => %{"tier" => "free"},
                      "tags" => ["draft"]
@@ -111,6 +113,34 @@ defmodule Ector.TranslatorTest do
     assert [%Cart{} = cart] = repo.all(Cart)
     assert cart.title == "Pending"
     assert cart.tags == ["stable"]
+  end
+
+  test "update_all/3 supports inc and push operators inside properties JSON" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert {1, nil} =
+             repo.insert_all(node_insert_target(), [
+               %{
+                 id: Ecto.UUID.autogenerate(version: 7, precision: :monotonic),
+                 label: User.__ector_label__(),
+                 properties:
+                   encoded_properties(%{
+                     "id" => "user-1",
+                     "count" => 5,
+                     "status" => "draft",
+                     "metadata" => %{},
+                     "tags" => ["draft"]
+                   })
+               }
+             ])
+
+    assert {1, nil} =
+             repo.update_all(User,
+               inc: [count: -2],
+               push: [tags: "sale"]
+             )
+
+    assert %User{count: 3, tags: ["draft", "sale"]} = repo.one(User)
   end
 
   test "properties_update_expression/2 builds Postgres scalar json_set fragments" do
@@ -174,6 +204,35 @@ defmodule Ector.TranslatorTest do
            ] = params
   end
 
+  test "properties_update_expression/2 builds Postgres inc and push fragments" do
+    assert {sql, params} = expanded_translator_output(FakePostgresRepo, inc: [count: -1])
+
+    assert sql =~ "jsonb_set"
+    assert sql =~ "#>>"
+
+    assert [
+             {%Ecto.Query.DynamicExpr{}, :any},
+             {["count"], {:array, :string}},
+             {%Ecto.Query.DynamicExpr{}, :any},
+             {["count"], {:array, :string}},
+             {-1, :integer}
+           ] = params
+
+    assert {sql, params} = expanded_translator_output(FakePostgresRepo, push: [tags: "sale"])
+
+    assert sql =~ "jsonb_set"
+    assert sql =~ "#>"
+    assert sql =~ "jsonb_build_array"
+
+    assert [
+             {%Ecto.Query.DynamicExpr{}, :any},
+             {["tags"], {:array, :string}},
+             {%Ecto.Query.DynamicExpr{}, :any},
+             {["tags"], {:array, :string}},
+             {~s("sale"), :any}
+           ] = params
+  end
+
   test "properties_update_expression/2 returns the properties field for empty generic updates" do
     assert {sql, params} = expanded_translator_output(FakePostgresRepo, [])
 
@@ -224,6 +283,24 @@ defmodule Ector.TranslatorTest do
              {~s({"tier":"pro"}), :any},
              {"$.published", :any},
              {"true", :any}
+           ] = params
+  end
+
+  test "properties_update_expression/2 builds SQLite inc and push fragments" do
+    assert {sql, params} =
+             expanded_translator_output(FakeSQLiteRepo,
+               inc: [count: -1],
+               push: [tags: "sale"]
+             )
+
+    assert sql =~ "json_extract"
+    assert sql =~ "json_insert"
+
+    assert [
+             {"$.count", :any},
+             {-1, :any},
+             {"$.tags", :any},
+             {~s("sale"), :any}
            ] = params
   end
 

@@ -69,6 +69,29 @@ defmodule Ector.Schema do
     associations = env.module |> Module.get_attribute(:ector_associations) |> Enum.reverse()
     label = label_for(env.module, kind)
     table = storage_table_for(kind)
+    changeset_defined? = Module.defines?(env.module, {:changeset, 2})
+
+    default_changeset =
+      if changeset_defined? do
+        quote(do: :ok)
+      else
+        quote do
+          def changeset(struct \\ %__MODULE__{}, attrs)
+
+          def changeset(struct, attrs) when is_list(attrs) do
+            changeset(struct, Map.new(attrs))
+          end
+
+          def changeset(struct, attrs) when is_map(attrs) do
+            struct
+            |> Ecto.Changeset.cast(attrs, __schema__(:fields) -- [:__id__])
+          end
+
+          def changeset(struct, _attrs) do
+            changeset(struct, %{})
+          end
+        end
+      end
 
     quote do
       @doc false
@@ -83,20 +106,7 @@ defmodule Ector.Schema do
       @doc false
       def __ector_associations__, do: unquote(Macro.escape(associations))
 
-      def changeset(struct \\ %__MODULE__{}, attrs)
-
-      def changeset(struct, attrs) when is_list(attrs) do
-        changeset(struct, Map.new(attrs))
-      end
-
-      def changeset(struct, attrs) when is_map(attrs) do
-        struct
-        |> Ecto.Changeset.cast(attrs, __schema__(:fields) -- [:__id__])
-      end
-
-      def changeset(struct, _attrs) do
-        changeset(struct, %{})
-      end
+      unquote(default_changeset)
     end
   end
 

@@ -89,4 +89,52 @@ defmodule Ector.Translator.Postgres do
       )
     )
   end
+
+  @doc false
+  @impl true
+  @spec json_inc(Macro.t(), [String.t()], number()) :: Macro.t()
+  def json_inc(acc, path, amount) when is_integer(amount) do
+    dynamic(
+      [row],
+      fragment(
+        "jsonb_set(?, ?, to_jsonb(COALESCE((? #>> ?)::integer, 0) + ?), true)",
+        ^acc,
+        type(^path, {:array, :string}),
+        ^acc,
+        type(^path, {:array, :string}),
+        type(^amount, :integer)
+      )
+    )
+  end
+
+  def json_inc(acc, path, amount) when is_float(amount) do
+    dynamic(
+      [row],
+      fragment(
+        "jsonb_set(?, ?, to_jsonb(COALESCE((? #>> ?)::double precision, 0) + ?), true)",
+        ^acc,
+        type(^path, {:array, :string}),
+        ^acc,
+        type(^path, {:array, :string}),
+        type(^amount, :float)
+      )
+    )
+  end
+
+  @doc false
+  @impl true
+  @spec json_push(Macro.t(), [String.t()], Ector.Translator.json_value_payload()) :: Macro.t()
+  def json_push(acc, path, %{encoded: encoded_value}) do
+    dynamic(
+      [row],
+      fragment(
+        "jsonb_set(?, ?, COALESCE(? #> ?, '[]'::jsonb) || jsonb_build_array((?::text)::jsonb), true)",
+        ^acc,
+        type(^path, {:array, :string}),
+        ^acc,
+        type(^path, {:array, :string}),
+        ^encoded_value
+      )
+    )
+  end
 end

@@ -88,6 +88,42 @@ defmodule Ector.QueryTest do
     end
   end
 
+  defmodule ChainProduct do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+    end
+  end
+
+  defmodule ChainOffer do
+    use Ector.Node
+
+    schema do
+      field(:price, :integer)
+
+      belongs_to(:product, ChainProduct, through: :product_offers)
+    end
+  end
+
+  defmodule ChainItem do
+    use Ector.Node
+
+    schema do
+      field(:quantity, :integer)
+
+      belongs_to(:offer, ChainOffer, through: :cart_item_offers)
+    end
+  end
+
+  defmodule ChainCart do
+    use Ector.Node
+
+    schema do
+      has_many(:items, ChainItem, through: :cart_items)
+    end
+  end
+
   test "from/1 targets the shared nodes table and preserves the domain module" do
     query = Ector.Query.from(u in User)
 
@@ -403,6 +439,45 @@ defmodule Ector.QueryTest do
         [],
         __ENV__
       )
+    end
+  end
+
+  test "join/3 can continue from a previous named target binding" do
+    joined =
+      ChainCart
+      |> Ector.Query.from()
+      |> Ector.Query.join(:items, as: :item)
+      |> Ector.Query.join(:offer, as: :offer, from: :item)
+      |> Ector.Query.join(:product, as: :product, from: :offer)
+
+    assert length(joined.joins) == 6
+    assert joined.aliases.item == 2
+    assert joined.aliases.offer == 4
+    assert joined.aliases.product == 6
+
+    [cart_item_edge, item_join, offer_item_edge, offer_join, product_offer_edge, product_join] =
+      joined.joins
+
+    assert cart_item_edge.source == {"edges", Ector.Edge}
+    assert item_join.source == {"nodes", ChainItem}
+    assert Enum.any?(cart_item_edge.on.params, &match?({"CART_ITEMS", _type}, &1))
+
+    assert offer_item_edge.source == {"edges", Ector.Edge}
+    assert offer_join.source == {"nodes", ChainOffer}
+    assert Enum.any?(offer_item_edge.on.params, &match?({"CART_ITEM_OFFERS", _type}, &1))
+    assert join_field_comparison?(offer_item_edge.on.expr, 3, :target_id, 2, :__id__)
+    assert join_field_comparison?(offer_join.on.expr, 4, :__id__, 3, :source_id)
+
+    assert product_offer_edge.source == {"edges", Ector.Edge}
+    assert product_join.source == {"nodes", ChainProduct}
+    assert Enum.any?(product_offer_edge.on.params, &match?({"PRODUCT_OFFERS", _type}, &1))
+    assert join_field_comparison?(product_offer_edge.on.expr, 5, :target_id, 4, :__id__)
+    assert join_field_comparison?(product_join.on.expr, 6, :__id__, 5, :source_id)
+
+    assert_raise ArgumentError, ~r/unknown Ector join source alias :missing/, fn ->
+      ChainCart
+      |> Ector.Query.from()
+      |> Ector.Query.join(:offer, as: :offer, from: :missing)
     end
   end
 

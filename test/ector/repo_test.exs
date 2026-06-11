@@ -30,6 +30,8 @@ defmodule Ector.RepoTest do
     schema do
       field(:name, :string)
       field(:metadata, :map, default: %{})
+      field(:tags, {:array, :string}, default: [])
+      field(:visits, :integer, default: 0)
 
       has_many(:carts, Cart, through: :has_cart)
     end
@@ -300,7 +302,7 @@ defmodule Ector.RepoTest do
              Ector.Repo.update_all(
                repo,
                query,
-               [set: [name: "Updated"]],
+               [set: [name: "Updated"], inc: [visits: 1], push: [tags: "query"]],
                [],
                fn executable_query, updates, _opts -> {:update, executable_query, updates} end
              )
@@ -575,6 +577,41 @@ defmodule Ector.RepoTest do
     assert [%PlainWidget{id: "widget-3", name: "Gamma"}] = repo.all(PlainWidget)
   end
 
+  test "direct update_all/4 supports standard Ecto operators for Ector properties" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert {:ok, %User{}} =
+             repo.insert(
+               User.changeset(%User{}, %{
+                 "id" => "user-direct",
+                 "name" => "Counter",
+                 "tags" => ["seed"],
+                 "visits" => 2
+               })
+             )
+
+    assert {1, nil} =
+             Ector.Repo.update_all(repo, User,
+               inc: [visits: 3],
+               push: [tags: "repo-first"]
+             )
+
+    query =
+      Ector.Query.from(user in User)
+      |> Ector.Query.where([user], user.id == ^"user-direct")
+
+    assert {1, nil} =
+             query
+             |> Ector.Repo.update_all(repo,
+               set: [name: "Updated"],
+               inc: [visits: -1],
+               push: [tags: "pipe"]
+             )
+
+    assert %User{name: "Updated", visits: 4, tags: ["seed", "repo-first", "pipe"]} =
+             repo.one(User)
+  end
+
   test "delete/2 rejects structs with missing or stale routing ids" do
     repo = Ector.TestRepo.repo_module()
 
@@ -646,8 +683,8 @@ defmodule Ector.RepoTest do
     assert {:fallback, :bogus} =
              Ector.Repo.delete(repo, :bogus, [], fn value, _opts -> {:fallback, value} end)
 
-    assert {:fallback, [inc: [name: 1]]} =
-             Ector.Repo.update_all(repo, User, [inc: [name: 1]], [], fn _query, updates, _opts ->
+    assert {:fallback, [pop: [name: 1]]} =
+             Ector.Repo.update_all(repo, User, [pop: [name: 1]], [], fn _query, updates, _opts ->
                {:fallback, updates}
              end)
   end
@@ -669,8 +706,8 @@ defmodule Ector.RepoTest do
     assert {:fallback, :bogus} =
              Ector.Repo.delete(repo, :bogus, [], fn value, _opts -> {:fallback, value} end)
 
-    assert {:fallback, [inc: [name: 1]]} =
-             Ector.Repo.update_all(repo, User, [inc: [name: 1]], [], fn _query, updates, _opts ->
+    assert {:fallback, [pop: [name: 1]]} =
+             Ector.Repo.update_all(repo, User, [pop: [name: 1]], [], fn _query, updates, _opts ->
                {:fallback, updates}
              end)
   end

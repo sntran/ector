@@ -23,6 +23,9 @@ defmodule Ector.Repo do
   alias Ecto.Changeset
   alias Ecto.Multi
 
+  @property_update_operators [:set, :inc, :push]
+  @storage_update_fields [:__id__, :label, :source_id, :target_id, :properties]
+
   @typedoc "Normalized JSON value stored in `nodes.properties` or `edges.properties`."
   @type json_value ::
           String.t() | number() | boolean() | nil | [json_value()] | %{String.t() => json_value()}
@@ -163,6 +166,31 @@ defmodule Ector.Repo do
     case storage_filter_query(queryable) do
       {:ok, _module, query} -> fallback.(query, opts)
       :error -> fallback.(queryable, opts)
+    end
+  end
+
+  @doc """
+  Executes an Ector-aware bulk update through the provided repo.
+
+  Standard Ecto update operators targeting domain fields are translated into
+  adapter-specific mutations of the shared `properties` JSON column. The
+  rewritten query is then delegated to the repo's native `update_all/3`.
+  """
+  @spec update_all(module() | term(), term() | module(), Keyword.t(), Keyword.t()) :: term()
+  def update_all(first, second, updates, opts \\ [])
+
+  def update_all(first, second, updates, opts)
+      when is_list(updates) and is_list(opts) do
+    case resolve_update_all_args(first, second) do
+      {:ok, repo, queryable} ->
+        case rewrite_update_all(repo, queryable, updates) do
+          {:ok, query, rewritten_updates} -> repo.update_all(query, rewritten_updates, opts)
+          :error -> repo.update_all(queryable, updates, opts)
+        end
+
+      :error ->
+        raise ArgumentError,
+              "expected an Ecto repo module plus an Ector queryable, got: #{inspect(first)} and #{inspect(second)}"
     end
   end
 
@@ -361,7 +389,8 @@ defmodule Ector.Repo do
                   field(row, :id) == ^hidden_id
             )
 
-          properties_update = Ector.Translator.properties_update_expression(repo, set_updates)
+          properties_update =
+            Ector.Translator.properties_update_expression(repo, set: set_updates)
 
           case repo.update_all(query, [set: [properties: properties_update]], storage_opts(opts)) do
             {1, _} ->
@@ -385,8 +414,8 @@ defmodule Ector.Repo do
           {:ok, Ecto.Query.t(), Keyword.t()} | :error
   defp rewrite_update_all(repo, queryable, updates) when is_atom(repo) and is_list(updates) do
     with {:ok, _module, query} <- storage_filter_query(queryable),
-         {:ok, set_updates} <- extract_set_updates(updates) do
-      properties_update = Ector.Translator.properties_update_expression(repo, set_updates)
+         {:ok, property_updates} <- extract_property_updates(updates) do
+      properties_update = Ector.Translator.properties_update_expression(repo, property_updates)
       {:ok, query, [set: [properties: properties_update]]}
     else
       _ -> :error
@@ -518,8 +547,59 @@ defmodule Ector.Repo do
     |> normalize_json()
   end
 
-  defp extract_set_updates(set: set_updates) when is_list(set_updates), do: {:ok, set_updates}
-  defp extract_set_updates(_updates), do: :error
+  defp extract_property_updates(updates) when is_list(updates) do
+    Enum.reduce_while(updates, {:ok, []}, fn
+      {operator, field_updates}, {:ok, acc}
+      when operator in @property_update_operators and is_list(field_updates) ->
+        if valid_property_updates?(operator, field_updates) do
+          {:cont, {:ok, [{operator, field_updates} | acc]}}
+        else
+          {:halt, :error}
+        end
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, property_updates} -> {:ok, Enum.reverse(property_updates)}
+      :error -> :error
+    end
+  end
+
+  defp valid_property_updates?(operator, field_updates) when is_list(field_updates) do
+    Enum.all?(field_updates, &valid_property_update?(operator, &1))
+  end
+
+  defp valid_property_update?(:inc, {field_name, value}) do
+    valid_property_field?(field_name) and is_number(value)
+  end
+
+  defp valid_property_update?(operator, {field_name, _value}) when operator in [:set, :push] do
+    valid_property_field?(field_name)
+  end
+
+  defp valid_property_update?(_operator, _update), do: false
+
+  defp valid_property_field?(field_name) when is_atom(field_name) do
+    field_name not in @storage_update_fields
+  end
+
+  defp valid_property_field?(field_name) when is_binary(field_name), do: field_name != ""
+  defp valid_property_field?(_field_name), do: false
+
+  defp resolve_update_all_args(first, second) do
+    cond do
+      repo_module?(first) -> {:ok, first, second}
+      repo_module?(second) -> {:ok, second, first}
+      true -> :error
+    end
+  end
+
+  defp repo_module?(module) when is_atom(module) do
+    Code.ensure_loaded?(module) and function_exported?(module, :__adapter__, 0)
+  end
+
+  defp repo_module?(_other), do: false
 
   defp storage_opts(opts), do: Keyword.take(opts, [:prefix, :timeout, :log])
 
@@ -607,7 +687,13 @@ defmodule Ector.Repo do
   defp rewrite_query_expr_hidden_id(nil), do: nil
 
   defp rewrite_query_expr_hidden_id(%{expr: expr} = query_expr) do
-    %{query_expr | expr: rewrite_hidden_id_ast(expr)}
+    rewritten = %{query_expr | expr: rewrite_hidden_id_ast(expr)}
+
+    if Map.has_key?(rewritten, :params) do
+      %{rewritten | params: rewrite_hidden_id_params(rewritten.params)}
+    else
+      rewritten
+    end
   end
 
   defp rewrite_hidden_id_ast(ast) do
@@ -617,6 +703,13 @@ defmodule Ector.Repo do
 
       other ->
         other
+    end)
+  end
+
+  defp rewrite_hidden_id_params(params) when is_list(params) do
+    Enum.map(params, fn
+      {value, {binding, :__id__}} when is_integer(binding) -> {value, {binding, :id}}
+      param -> param
     end)
   end
 
