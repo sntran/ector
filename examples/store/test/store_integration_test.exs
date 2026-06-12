@@ -144,7 +144,7 @@ defmodule StoreIntegrationTest do
     assert Enum.map(vendor_page.entries, & &1.id) == ["offer-2"]
   end
 
-  test "get_cart_summary loads Cart -> CartItem -> Offer -> Product without preload" do
+  test "get_cart_summary preloads Cart -> CartItem -> Offer -> Product" do
     seed_storefront_fixture!()
 
     assert %{

@@ -3,7 +3,7 @@ defmodule Store.Catalog do
   Catalog read workflows for the zero-migration storefront.
 
   Listing queries stay on `Store.Catalog.Offer` properties. Product images are
-  fetched only by checkout graph reads that need the final product hop.
+  fetched only when display reads preload the final product hop.
   """
 
   import Ecto.Query, only: [limit: 2]
@@ -91,8 +91,8 @@ defmodule Store.Catalog do
   @doc """
   Lists offer cards for the LiveView catalog.
 
-  Filtering and sorting still target `Offer` properties. The product join is
-  added only to display images for the visible page.
+  Filtering and sorting still target `Offer` properties. Product images are
+  loaded through `Repo.preload/2` only for the visible page.
   """
   @spec list_offer_cards(keyword() | map()) :: [map()]
   def list_offer_cards(opts \\ []) when is_list(opts) or is_map(opts) do
@@ -125,22 +125,11 @@ defmodule Store.Catalog do
       |> apply_price_filter(:min_price, opt(opts, :min_price))
       |> apply_price_filter(:max_price, opt(opts, :max_price))
       |> apply_search(search)
-      |> Ector.join(:product, as: :product)
       |> apply_sort(sort, direction)
       |> limit(^page_size)
-      |> Ector.select([offer, product: product], %{
-        id: offer.id,
-        cursor: offer.__id__,
-        product_id: offer.product_id,
-        offered_by: offer.offered_by,
-        price: offer.price,
-        quantity: offer.quantity,
-        product_name: offer.product_name,
-        product_description: offer.product_description,
-        images: product.images
-      })
       |> Repo.all()
-      |> Enum.map(&Map.update!(&1, :images, fn images -> normalize_images(images) end))
+      |> Repo.preload(:product)
+      |> Enum.map(&offer_card/1)
 
     build_page(sort, direction, rows, limit)
   end
@@ -183,20 +172,9 @@ defmodule Store.Catalog do
   def get_offer_details(offer_id) when is_binary(offer_id) do
     Offer
     |> Ector.from()
-    |> Ector.join(:product, as: :product)
     |> Ector.where([offer], offer.id == ^offer_id)
-    |> Ector.select([offer, product: product], %{
-      id: offer.id,
-      cursor: offer.__id__,
-      product_id: offer.product_id,
-      offered_by: offer.offered_by,
-      price: offer.price,
-      quantity: offer.quantity,
-      product_name: offer.product_name,
-      product_description: offer.product_description,
-      product_images: product.images
-    })
     |> Repo.one()
+    |> Repo.preload(:product)
     |> normalize_offer_detail()
   end
 
@@ -360,12 +338,31 @@ defmodule Store.Catalog do
   end
 
   defp normalize_offer_detail(nil), do: nil
+  defp normalize_offer_detail(%Offer{} = offer), do: offer_card(offer)
 
-  defp normalize_offer_detail(offer) do
-    offer
-    |> Map.put(:product_images, normalize_images(offer.product_images))
-    |> Map.put(:images, normalize_images(offer.product_images))
-    |> Map.delete(:product_images)
+  defp offer_card(%Offer{} = offer) do
+    %{
+      id: offer.id,
+      cursor: offer.__id__,
+      product_id: offer.product_id,
+      offered_by: offer.offered_by,
+      price: offer.price,
+      quantity: offer.quantity,
+      product_name: offer.product_name,
+      product_description: offer.product_description,
+      images: product_images(offer)
+    }
+  end
+
+  defp product_images(%Offer{} = offer) do
+    case loaded_association(offer, :product) do
+      %{images: images} -> normalize_images(images)
+      _missing -> []
+    end
+  end
+
+  defp loaded_association(struct, key) when is_map(struct) and is_atom(key) do
+    Map.get(struct, key)
   end
 
   defp normalize_images(images) when is_list(images), do: images

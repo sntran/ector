@@ -2,8 +2,9 @@ defmodule Store.Checkout do
   @moduledoc """
   Checkout read workflows over the Ector graph.
 
-  Cart summaries are loaded with chained `Ector.join/3` calls. The final product
-  hop supplies images without duplicating image arrays onto offer nodes.
+  Cart summaries load the selected cart directly, then preload
+  `Cart -> CartItem -> Offer -> Product` without duplicating image arrays onto
+  offer nodes.
   """
 
   alias Store.Catalog.Offer
@@ -61,51 +62,24 @@ defmodule Store.Checkout do
     end
   end
 
-  defp get_cart_summary_for_cart(%{__id__: cart_storage_id} = selected_cart) do
-    rows =
-      Cart
-      |> Ector.from()
-      |> Ector.join(:items, as: :item)
-      |> Ector.join(:offer, as: :offer, from: :item)
-      |> Ector.join(:product, as: :product, from: :offer)
-      |> Ector.where([cart], cart.__id__ == ^cart_storage_id)
-      |> Ector.select([cart, item: item, offer: offer, product: product], %{
-        cart_id: cart.id,
-        cart_status: cart.status,
-        item_id: item.id,
-        quantity: item.quantity,
-        price_at_addition: item.price_at_addition,
-        offer_id: offer.id,
-        offered_by: offer.offered_by,
-        product_id: offer.product_id,
-        product_name: offer.product_name,
-        product_description: offer.product_description,
-        product_images: product.images
-      })
-      |> Repo.all()
-
-    case rows do
-      [] ->
-        empty_summary(selected_cart)
-
-      rows ->
-        build_summary(rows)
-    end
+  defp get_cart_summary_for_cart(%Cart{} = selected_cart) do
+    selected_cart
+    |> Repo.preload(items: [offer: :product])
+    |> build_summary()
   end
 
   @doc "Returns one cart projection by its business id."
-  @spec get_cart(String.t()) :: map() | nil
+  @spec get_cart(String.t()) :: Cart.t() | nil
   def get_cart(cart_id) when is_binary(cart_id) do
     Cart
     |> Ector.from()
     |> Ector.where([cart], cart.id == ^cart_id)
-    |> Ector.select([cart], %{id: cart.id, __id__: cart.__id__, status: cart.status})
     |> Repo.all()
     |> current_cart()
   end
 
   @doc "Ensures the LiveView storefront has an active cart to mutate."
-  @spec ensure_active_cart!(String.t()) :: map()
+  @spec ensure_active_cart!(String.t()) :: Cart.t()
   def ensure_active_cart!(cart_id \\ default_cart_id()) when is_binary(cart_id) do
     case get_cart(cart_id) do
       %{status: "active"} = cart -> cart
@@ -115,7 +89,7 @@ defmodule Store.Checkout do
   end
 
   @doc "Creates a new empty active cart for continued shopping after checkout."
-  @spec create_active_cart!(String.t()) :: map()
+  @spec create_active_cart!(String.t()) :: Cart.t()
   def create_active_cart!(cart_id \\ default_cart_id()) when is_binary(cart_id) do
     insert_cart!(cart_id)
   end
@@ -234,32 +208,20 @@ defmodule Store.Checkout do
     end
   end
 
-  defp build_summary(rows) do
-    [%{cart_id: cart_id, cart_status: status} | _rest] = rows
-
+  defp build_summary(%Cart{} = cart) do
     items =
-      rows
+      cart
+      |> loaded_association(:items, [])
       |> Enum.map(&item_summary/1)
       |> Enum.sort_by(& &1.item_id)
 
     %{
-      id: cart_id,
-      status: status,
+      id: cart.id,
+      status: cart.status,
       item_count: length(items),
       quantity_total: Enum.reduce(items, 0, &(&1.quantity + &2)),
       subtotal: Enum.reduce(items, 0, &(&1.quantity * &1.price_at_addition + &2)),
       items: items
-    }
-  end
-
-  defp empty_summary(cart) do
-    %{
-      id: cart.id,
-      status: cart.status,
-      item_count: 0,
-      quantity_total: 0,
-      subtotal: 0,
-      items: []
     }
   end
 
@@ -274,23 +236,37 @@ defmodule Store.Checkout do
     |> List.first()
   end
 
-  defp item_summary(row) do
+  defp item_summary(%CartItem{} = item) do
+    offer = loaded_association!(item, :offer)
+    product = loaded_association!(offer, :product)
+
     %{
-      item_id: row.item_id,
-      quantity: row.quantity,
-      price_at_addition: row.price_at_addition,
+      item_id: item.id,
+      quantity: item.quantity,
+      price_at_addition: item.price_at_addition,
       offer: %{
-        id: row.offer_id,
-        offered_by: row.offered_by,
-        product_id: row.product_id,
-        product_name: row.product_name,
-        product_description: row.product_description
+        id: offer.id,
+        offered_by: offer.offered_by,
+        product_id: offer.product_id,
+        product_name: offer.product_name,
+        product_description: offer.product_description
       },
       product: %{
-        id: row.product_id,
-        images: normalize_images(row.product_images)
+        id: product.id,
+        images: normalize_images(product.images)
       }
     }
+  end
+
+  defp loaded_association(struct, key, default) when is_map(struct) and is_atom(key) do
+    Map.get(struct, key, default)
+  end
+
+  defp loaded_association!(struct, key) when is_map(struct) and is_atom(key) do
+    case Map.fetch(struct, key) do
+      {:ok, value} -> value
+      :error -> raise KeyError, key: key, term: struct
+    end
   end
 
   defp normalize_images(images) when is_list(images), do: images
@@ -434,7 +410,7 @@ defmodule Store.Checkout do
       Storage.node_row(Cart, %{id: cart_id, status: "active"}, storage_id)
     ])
 
-    %{id: cart_id, __id__: storage_id, status: "active"}
+    %Cart{id: cart_id, __id__: storage_id, status: "active"}
   end
 
   defp get_offer_node!(offer_id) do

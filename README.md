@@ -20,6 +20,7 @@ Add a new field to your schema? Just type it and deploy. Zero database migration
 * **Pure Ecto Developer Experience:** If you know Ecto, you know Ector. It mirrors the exact APIs you are used to.
 * **Zero Migrations for Domain Entities:** Only one migration is needed to set up the core engine. After that, schemas are defined purely in application code.
 * **Identity Isolation:** You own your `id` field (e.g., Stripe ID, ERP ID). Ector manages the database topology silently using a hidden `__id__` (UUIDv7).
+* **Native Graph Preloading:** Use normal `Repo.preload/2` and `Repo.preload/3` syntax. Ector batches association hydration through the `edges` and `nodes` tables for `belongs_to`, `has_many`, and `has_one` without parent-by-parent N+1 queries.
 * **Multi-Tenant Ready:** Native, zero-touch support for Ecto's `prefix` option across all queries and hidden joins.
 * **High Performance:** Leverages native UUIDv7 for time-ordered B-tree indexing, and fully supports PostgreSQL GIN indexing and SQLite binary JSON.
 * **Modern BEAM Power:** Built strictly for Elixir 1.20+ and Erlang 29+, utilizing gradual typing and the native C-backed `JSON` module for maximum throughput.
@@ -29,7 +30,6 @@ Add a new field to your schema? Just type it and deploy. Zero database migration
 To maintain a pure Ecto experience, Ector makes specific architectural trade-offs:
 * **It is not a Graph Database:** While backed by nodes and edges, Ector does not expose a graph query language (like Cypher or Gremlin) or handle infinite-depth recursive graph algorithms. It maps relational intent to a graph structure.
 * **No Database-Level Foreign Keys for Domain Fields:** Because your data lives in JSONB, you cannot enforce standard SQL foreign key constraints on domain fields (e.g., `user_id` inside the properties JSON). You must rely on Ecto constraints and Ector's edge topology.
-* **No `preload/2` (Yet):** Standard Ecto preloading is not supported due to the hidden double-hop edge joins. You should use `Ector.join/3` and `Ector.select/3` to build aggregate payloads.
 
 ## Extensibility & Optimizations
 
@@ -63,7 +63,22 @@ Ector operates across a few key boundaries to maintain the Ecto illusion:
 
 -   **AST Redirection:** `Ector.Query` macros (`from`, `where`, `select`) hygienically rewrite your Elixir AST at compile time. `u.status == "active"` is rewritten to Ecto's native dynamic JSON path syntax: `u.properties["status"] == "active"`.
 
--   **Adapter-Aware Bulk Mutations:** When running bulk `update_all` queries, `Ector.Repo` dynamically generates database-specific AST fragments (`jsonb_set` for Postgres, variadic `json_set` for SQLite) to update JSON fields atomically without pulling records into memory.
+-   **Graph-Aware Preloading:** `Ector.Repo.preload/4` accepts standard Ecto preload shapes such as `:product`, `[:profile, :posts]`, and `[items: [offer: :product]]`. For `has_many` and `has_one`, it batches edge lookups by parent `__id__` and joins the target `nodes`. For `belongs_to`, it resolves JSON-stored UUIDv7 references directly and falls back to the edge topology when the domain field stores a business identifier. Hydrated structs are stitched back into the original association fields just like native Ecto preloads.
+
+-   **Adapter-Aware Bulk Mutations:** When running bulk `update_all` queries, `Ector.Repo` translates idiomatic Ecto update operators into database-specific JSON mutations without pulling records into memory. `set`, `inc`, and `push` all target the shared `properties` payload and compile through the adapter boundary.
+
+```elixir
+Offer
+|> Ector.from()
+|> Ector.where([offer], offer.id == ^offer_id and offer.quantity >= ^quantity)
+|> Ector.Repo.update_all(MyApp.Repo,
+  inc: [quantity: -quantity],
+  set: [status: "reserved"],
+  push: [events: %{type: "reserved", quantity: quantity}]
+)
+```
+
+PostgreSQL receives nested `jsonb_set` / `jsonb_build_array` expressions. SQLite receives equivalent `json_set` / `json_insert` expressions. The query is still planned and executed by Ecto's native adapter.
 
 -   **Deterministic Edge Aliasing:** When you call `Ector.join(:carts, as: :cart)`, Ector injects a hidden join for the intermediate `edges` table, and applies your `:cart` alias directly to the target node. This keeps your bindings clean and predictable.
 

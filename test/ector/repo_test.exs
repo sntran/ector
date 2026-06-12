@@ -34,6 +34,66 @@ defmodule Ector.RepoTest do
       field(:visits, :integer, default: 0)
 
       has_many(:carts, Cart, through: :has_cart)
+      has_many(:posts, Ector.RepoTest.Post, through: :user_posts)
+      has_one(:profile, Ector.RepoTest.Profile, through: :user_profiles)
+    end
+  end
+
+  defmodule Post do
+    use Ector.Node
+
+    schema do
+      field(:title, :string)
+      field(:user_id, Ecto.UUID)
+
+      belongs_to(:user, Ector.RepoTest.User, through: :user_posts)
+      has_many(:comments, Ector.RepoTest.Comment, through: :post_comments)
+      has_one(:spotlight_comment, Ector.RepoTest.Comment, through: :post_spotlight_comment)
+    end
+  end
+
+  defmodule Comment do
+    use Ector.Node
+
+    schema do
+      field(:body, :string)
+      field(:post_id, Ecto.UUID)
+
+      belongs_to(:post, Ector.RepoTest.Post, through: :post_comments)
+    end
+  end
+
+  defmodule Profile do
+    use Ector.Node
+
+    schema do
+      field(:bio, :string)
+
+      belongs_to(:user, Ector.RepoTest.User, through: :user_profiles)
+    end
+  end
+
+  defmodule BusinessParent do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+
+      has_many(:business_posts, Ector.RepoTest.BusinessPost, through: :business_posts)
+    end
+  end
+
+  defmodule BusinessPost do
+    use Ector.Node
+
+    schema do
+      field(:title, :string)
+      field(:business_parent_id, :string)
+
+      belongs_to(:business_parent, Ector.RepoTest.BusinessParent,
+        through: :business_posts,
+        foreign_key: :business_parent_id
+      )
     end
   end
 
@@ -151,6 +211,142 @@ defmodule Ector.RepoTest do
     end)
 
     :ok
+  end
+
+  test "preload/4 hydrates a has_many association on a single struct" do
+    repo = Ector.TestRepo.repo_module()
+    %{ada: user} = seed_graph!(repo)
+
+    loaded = Ector.Repo.preload(repo, user, :posts)
+
+    assert %User{id: "user-1"} = loaded
+    assert loaded.posts |> Enum.map(& &1.id) |> Enum.sort() == ["post-1", "post-2"]
+    assert Enum.all?(loaded.posts, &match?(%Post{}, &1))
+  end
+
+  test "preload/4 batches list has_many loading without parent N+1 queries" do
+    repo = Ector.TestRepo.repo_module()
+    %{ada: ada, grace: grace, no_posts: no_posts} = seed_graph!(repo)
+
+    handler_id = {__MODULE__, :list_preload, make_ref()}
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        repo_query_event(repo),
+        fn _event, _measurements, metadata, _config ->
+          send(test_pid, {:repo_query, metadata.query})
+        end,
+        nil
+      )
+
+    loaded =
+      try do
+        Ector.Repo.preload(repo, [ada, grace, no_posts], :posts)
+      after
+        :telemetry.detach(handler_id)
+      end
+
+    queries = collect_queries()
+
+    assert length(queries) == 1
+    assert [loaded_ada, loaded_grace, loaded_no_posts] = loaded
+    assert loaded_ada.posts |> Enum.map(& &1.id) |> Enum.sort() == ["post-1", "post-2"]
+    assert loaded_grace.posts |> Enum.map(& &1.id) == ["post-3"]
+    assert loaded_no_posts.posts == []
+  end
+
+  test "preload/4 recursively resolves nested preloads" do
+    repo = Ector.TestRepo.repo_module()
+    %{ada: user} = seed_graph!(repo)
+
+    loaded = Ector.Repo.preload(repo, user, posts: :comments)
+
+    post_1 = Enum.find(loaded.posts, &(&1.id == "post-1"))
+    post_2 = Enum.find(loaded.posts, &(&1.id == "post-2"))
+
+    assert post_1.comments |> Enum.map(& &1.id) |> Enum.sort() == ["comment-1", "comment-2"]
+    assert post_2.comments == []
+  end
+
+  test "preload/4 resolves has_one and belongs_to graph associations" do
+    repo = Ector.TestRepo.repo_module()
+    %{ada: user} = seed_graph!(repo)
+
+    loaded_user = Ector.Repo.preload(repo, user, :profile)
+    assert %Profile{bio: "Lovelace profile"} = loaded_user.profile
+
+    post =
+      repo.all(Post)
+      |> Enum.find(&(&1.id == "post-1"))
+
+    loaded_post = Ector.Repo.preload(repo, post, [:user, :spotlight_comment])
+
+    assert %User{id: "user-1"} = loaded_post.user
+    assert %Comment{id: "comment-spotlight"} = loaded_post.spotlight_comment
+  end
+
+  test "preload/4 resolves belongs_to from JSON foreign key references" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert {:ok, user} =
+             User.changeset(%User{}, %{"id" => "fk-user", "name" => "Foreign Key"})
+             |> repo.insert()
+
+    assert {:ok, post} =
+             Post.changeset(%Post{}, %{
+               "id" => "fk-post",
+               "title" => "Direct JSON FK",
+               "user_id" => user.__id__
+             })
+             |> repo.insert()
+
+    loaded = Ector.Repo.preload(repo, post, :user)
+
+    assert %User{id: "fk-user", __id__: user_id} = loaded.user
+    assert user_id == user.__id__
+  end
+
+  test "preload/4 falls back to graph edges when a belongs_to field stores a business id" do
+    repo = Ector.TestRepo.repo_module()
+
+    post =
+      BusinessPost.changeset(%BusinessPost{}, %{
+        "id" => "business-fk-post",
+        "title" => "Business ID FK",
+        "business_parent_id" => "business-parent"
+      })
+
+    parent =
+      BusinessParent.changeset(%BusinessParent{}, %{
+        "id" => "business-parent",
+        "name" => "Business ID"
+      })
+      |> Ector.Changeset.put_edge(:business_posts, [{post, %{}}])
+
+    assert {:ok, _parent} = repo.insert(parent)
+
+    post =
+      repo.all(BusinessPost)
+      |> Enum.find(&(&1.id == "business-fk-post"))
+
+    loaded = Ector.Repo.preload(repo, post, :business_parent)
+
+    assert %BusinessParent{id: "business-parent"} = loaded.business_parent
+  end
+
+  test "preload/4 handles nil empty lists and missing edge rows" do
+    repo = Ector.TestRepo.repo_module()
+    %{no_posts: no_posts} = seed_graph!(repo)
+
+    assert Ector.Repo.preload(repo, nil, :posts) == nil
+    assert Ector.Repo.preload(repo, [], :posts) == []
+
+    loaded = Ector.Repo.preload(repo, no_posts, [:posts, :profile])
+
+    assert loaded.posts == []
+    assert loaded.profile == nil
   end
 
   test "insert/2 persists source target and routing edge rows" do
@@ -841,6 +1037,57 @@ defmodule Ector.RepoTest do
       source_changeset
       |> Ector.Changeset.put_edge(:unknown, [{target_changeset, %{"status" => "active"}}])
       |> repo.insert()
+    end
+  end
+
+  defp seed_graph!(repo) do
+    ada_profile =
+      Profile.changeset(%Profile{}, %{"id" => "profile-1", "bio" => "Lovelace profile"})
+
+    post_1 =
+      Post.changeset(%Post{}, %{"id" => "post-1", "title" => "Analytical Engine"})
+      |> Ector.Changeset.put_edge(:comments, [
+        {Comment.changeset(%Comment{}, %{"id" => "comment-1", "body" => "First"}), %{}},
+        {Comment.changeset(%Comment{}, %{"id" => "comment-2", "body" => "Second"}), %{}}
+      ])
+      |> Ector.Changeset.put_edge(:spotlight_comment, [
+        {Comment.changeset(%Comment{}, %{"id" => "comment-spotlight", "body" => "Pinned"}), %{}}
+      ])
+
+    post_2 = Post.changeset(%Post{}, %{"id" => "post-2", "title" => "Notes"})
+
+    ada =
+      User.changeset(%User{}, %{"id" => "user-1", "name" => "Ada"})
+      |> Ector.Changeset.put_edge(:profile, [{ada_profile, %{}}])
+      |> Ector.Changeset.put_edge(:posts, [{post_1, %{}}, {post_2, %{}}])
+
+    grace_post = Post.changeset(%Post{}, %{"id" => "post-3", "title" => "Compiler"})
+
+    grace =
+      User.changeset(%User{}, %{"id" => "user-2", "name" => "Grace"})
+      |> Ector.Changeset.put_edge(:posts, [{grace_post, %{}}])
+
+    no_posts = User.changeset(%User{}, %{"id" => "user-3", "name" => "No Posts"})
+
+    assert {:ok, ada} = repo.insert(ada)
+    assert {:ok, grace} = repo.insert(grace)
+    assert {:ok, no_posts} = repo.insert(no_posts)
+
+    %{ada: ada, grace: grace, no_posts: no_posts}
+  end
+
+  defp repo_query_event(repo) do
+    repo
+    |> Module.split()
+    |> Enum.map(&(&1 |> Macro.underscore() |> String.to_atom()))
+    |> Kernel.++([:query])
+  end
+
+  defp collect_queries(queries \\ []) do
+    receive do
+      {:repo_query, query} -> collect_queries([query | queries])
+    after
+      50 -> Enum.reverse(queries)
     end
   end
 

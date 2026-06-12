@@ -19,6 +19,7 @@ end
 bench_opts = [
   warmup: parse_seconds.("BENCH_WARMUP", "1"),
   time: parse_seconds.("BENCH_TIME", "3"),
+  memory_time: parse_seconds.("BENCH_MEMORY_TIME", "1"),
   print: [fast_warning: false]
 ]
 
@@ -130,10 +131,13 @@ Benchee.run(
          Store.Sandbox.reset!()
          :ok
        end},
-    "offer listing page" =>
-      {fn _input -> Catalog.list_offers(limit: 50, search: "product") end,
-       before_each: fn _input -> seed.(n) end},
-    "cart summary graph join" =>
+    "single-cursor catalog search" =>
+      {fn cursor -> Catalog.list_offers(limit: 50, search: "product", cursor: cursor) end,
+       before_each: fn _input ->
+         seed.(n)
+         Catalog.list_offers(limit: 50, search: "product").next_cursor
+       end},
+    "4-hop preload cart summary" =>
       {fn _input -> Checkout.get_cart_summary("bench-cart") end,
        before_each: fn _input -> seed.(n) end}
   },

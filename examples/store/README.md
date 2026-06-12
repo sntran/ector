@@ -58,6 +58,73 @@ cd examples/store
 MIX_DEPS_PATH=../../deps mix test
 ```
 
+## Architecture Patterns
+
+The example is intentionally small, but it exercises the production paths that
+matter for Ector-backed applications.
+
+### Denormalized Offer Boundary
+
+`Store.Catalog.Offer` is the catalog read boundary. It stores the fields needed
+for search, filtering, sorting, and cursor pagination directly on the Offer
+node: product id, vendor, price, quantity, product name, and product
+description. That keeps infinite scroll on one Ector query over Offer
+properties.
+
+`Store.Catalog.Product` still owns product media. The catalog preloads the
+Product hop only for visible cards and detail pages:
+
+```elixir
+Offer
+|> Ector.from()
+|> Repo.all()
+|> Repo.preload(:product)
+```
+
+### Single-Cursor Bidirectional Pagination
+
+The LiveView catalog uses one public query parameter: `?cursor=token`. The token
+is a URL-safe Base64 envelope containing the storage cursor and direction:
+
+```elixir
+%{value: offer.__id__, dir: "next"}
+|> JSON.encode_to_iodata!()
+|> IO.iodata_to_binary()
+|> Base.url_encode64(padding: false)
+```
+
+The decoded `dir` drives whether the query asks for the next or previous page.
+No split `after` / `before` URL state is required.
+
+### Four-Hop Cart Summary
+
+Checkout fetches the selected `Cart` by business id, then hydrates the read
+model through nested Ector preloads:
+
+```elixir
+cart
+|> Repo.preload(items: [offer: :product])
+```
+
+That resolves `Cart -> CartItem -> Offer -> Product` while preserving the
+normal `@cart.items`, `item.offer`, and `item.offer.product.images` shape that
+LiveView templates expect.
+
+### Atomic Flash Sale Checkout
+
+Checkout uses an `Ecto.Multi` transaction for stock reservation and cart
+conversion. Each stock decrement stays in the database through Ector's
+operator-style JSON update translation:
+
+```elixir
+query
+|> Ector.Repo.update_all(repo, inc: [quantity: -quantity])
+```
+
+The decrement query is guarded by the current JSON quantity
+(`quantity > 0` and `quantity >= ^quantity`). If any line is out of stock, the
+transaction rolls back and the cart remains active.
+
 ## PostgreSQL Run
 
 The repo adapter is compiled from `STORE_ADAPTER`, so clean the example build
@@ -77,9 +144,10 @@ The integration suite resets and migrates one Ector repo, then asserts:
 * the Offer uniqueness index targets JSON `product_id` and `offered_by` while
   staying scoped to the `Offer` label;
 * offer listing uses denormalized Offer text and cursor pagination over
-  descending `__id__`; and
-* cart summaries load `Cart -> CartItem -> Offer -> Product` with
-  `Ector.join/3` and `Ector.select/3`, without `preload/2`.
+  descending `__id__`;
+* cart summaries preload `Cart -> CartItem -> Offer -> Product`; and
+* checkout decrements stock atomically with `inc: [quantity: -quantity]` before
+  converting the cart.
 
 Run the browser-facing smoke tests with the same command:
 

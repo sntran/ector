@@ -14,9 +14,26 @@ only happen in a major release and are documented in the [CHANGELOG](CHANGELOG.m
 | `Ector` | The query façade macros (`from`, `where`, `select`, `join`, …). |
 | `Ector.Node` / `Ector.Edge` | The `use` macro, `schema do … end`, and the `has_many`/`has_one`/`belongs_to` association DSL. |
 | `Ector.Changeset` | `put_edge/3` and the tuple-payload shape. |
-| `Ector.Repo` | The `use Ector.Repo` macro and the overridden `Ecto.Repo` callbacks (`all`, `one`, `insert`, `update`, `delete`, `delete_all`, `update_all`). |
+| `Ector.Repo` | The `use Ector.Repo` macro and the overridden `Ecto.Repo` callbacks (`all`, `one`, `insert`, `update`, `delete`, `delete_all`, `update_all`, `preload`). |
 | `Ector.Migration` | `use Ector.Migration`, `up/1`, `down/1`, and the smart `index/3`. |
 | `Ector.Query` | The query-building macros. |
+
+## Engine Status
+
+The core engine is stable and covered by executable tests. The AST translation
+proxy, dynamic schema compilation, storage-row hydration, graph insert/delete
+routing, adapter-aware JSON mutation rewriting, and `Repo.preload` association
+hydration all execute through the same public APIs that applications use.
+
+In practical terms:
+
+- domain field reads are redirected to `properties` while `__id__` remains the
+  hidden storage identity;
+- dynamic schemas compile without runtime registries or module lookup tables;
+- `set`, `inc`, and `push` bulk updates are translated into adapter-native JSON
+  expressions; and
+- `belongs_to`, `has_many`, and `has_one` preloads batch graph traversal through
+  the `edges` and `nodes` tables.
 
 ### Stable reflection
 
@@ -28,7 +45,8 @@ on your node/edge modules are part of the public contract and safe to call.
 These may change at any time, in any release. Do not depend on them from
 application code:
 
-- `Ector.Schema` — the macro engine behind `Ector.Node`/`Ector.Edge`.
+- The internal schema macro engine in `lib/ector/schema.ex` behind
+  `Ector.Node`/`Ector.Edge`.
 - `Ector.Translator` and `Ector.Translator.Postgres` / `Ector.Translator.SQLite`
   — adapter-specific JSON mutation builders.
 - Internal reflection/helpers: `__storage_source__/1`, `__association__!/2`,

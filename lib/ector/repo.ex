@@ -8,8 +8,9 @@ defmodule Ector.Repo do
 
   The wrapper hydrates raw storage rows back into the caller's schema modules,
   persists nested graph inserts through a transaction boundary, rewrites bulk
-  `set` updates into adapter-native JSON mutations, and ensures deletes target
-  the hidden `__id__` routing key instead of the caller's business identifier.
+  `set` updates into adapter-native JSON mutations, preloads graph associations,
+  and ensures deletes target the hidden `__id__` routing key instead of the
+  caller's business identifier.
 
   Ector queries intentionally carry the domain module in their source tuple
   until this boundary. Just before execution, the wrapper swaps those sources to
@@ -60,7 +61,9 @@ defmodule Ector.Repo do
                      delete_all: 1,
                      delete_all: 2,
                      update_all: 2,
-                     update_all: 3
+                     update_all: 3,
+                     preload: 2,
+                     preload: 3
 
       def all(queryable, opts \\ []),
         do: Ector.Repo.all(__MODULE__, queryable, opts, fn q, o -> super(q, o) end)
@@ -85,6 +88,14 @@ defmodule Ector.Repo do
           Ector.Repo.update_all(__MODULE__, queryable, updates, opts, fn q, u, o ->
             super(q, u, o)
           end)
+
+      def preload(struct_or_structs, preloads, opts \\ []) do
+        if Ector.Repo.preloadable?(struct_or_structs) do
+          Ector.Repo.preload(__MODULE__, struct_or_structs, preloads, opts)
+        else
+          super(struct_or_structs, preloads, opts)
+        end
+      end
     end
   end
 
@@ -204,6 +215,399 @@ defmodule Ector.Repo do
     case rewrite_update_all(repo, queryable, updates) do
       {:ok, query, rewritten_updates} -> fallback.(query, rewritten_updates, opts)
       :error -> fallback.(queryable, updates, opts)
+    end
+  end
+
+  @doc """
+  Preloads Ector graph associations through the provided repo.
+
+  The accepted preload shape mirrors Ecto's atom/list/keyword syntax. Ector
+  batches every top-level association over the parent list, reads the shared
+  `edges` and `nodes` tables directly, hydrates target nodes into their domain
+  structs, and then recurses into nested preloads.
+  """
+  @spec preload(module(), nil | struct() | [struct() | nil], term(), Keyword.t()) ::
+          nil | struct() | [struct() | nil]
+  def preload(repo, struct_or_structs, preloads, opts \\ [])
+
+  def preload(repo, nil, _preloads, opts) when is_atom(repo) and is_list(opts), do: nil
+
+  def preload(repo, structs, preloads, opts)
+      when is_atom(repo) and is_list(structs) and is_list(opts) do
+    preload_structs(repo, structs, normalize_preloads(preloads), opts)
+  end
+
+  def preload(repo, %module{} = struct, preloads, opts)
+      when is_atom(repo) and is_atom(module) and is_list(opts) do
+    case preload(repo, [struct], preloads, opts) do
+      [loaded] -> loaded
+      [] -> struct
+    end
+  end
+
+  def preload(_repo, struct_or_structs, _preloads, _opts) do
+    raise ArgumentError,
+          "expected an Ector schema struct, nil, or a list of Ector schema structs, got: #{inspect(struct_or_structs)}"
+  end
+
+  @doc false
+  @spec preloadable?(term()) :: boolean()
+  def preloadable?(nil), do: true
+  def preloadable?([]), do: true
+
+  def preloadable?(%module{}) when is_atom(module) do
+    ector_schema_module?(module)
+  end
+
+  def preloadable?(structs) when is_list(structs) do
+    Enum.all?(structs, fn
+      nil -> true
+      %module{} -> ector_schema_module?(module)
+      _other -> false
+    end)
+  end
+
+  def preloadable?(_other), do: false
+
+  @spec normalize_preloads(term()) :: [{atom(), term()}]
+  defp normalize_preloads([]), do: []
+
+  defp normalize_preloads(association_name) when is_atom(association_name),
+    do: [{association_name, []}]
+
+  defp normalize_preloads(preloads) when is_list(preloads) do
+    Enum.flat_map(preloads, fn
+      association_name when is_atom(association_name) ->
+        [{association_name, []}]
+
+      {association_name, nested_preloads} when is_atom(association_name) ->
+        [{association_name, nested_preloads}]
+
+      preload ->
+        raise ArgumentError, "unsupported Ector preload expression: #{inspect(preload)}"
+    end)
+  end
+
+  defp normalize_preloads(preloads) do
+    raise ArgumentError, "unsupported Ector preload expression: #{inspect(preloads)}"
+  end
+
+  @spec preload_structs(module(), [struct() | nil], [{atom(), term()}], Keyword.t()) :: [
+          struct() | nil
+        ]
+  defp preload_structs(_repo, structs, [], _opts), do: structs
+  defp preload_structs(_repo, [], _preloads, _opts), do: []
+
+  defp preload_structs(repo, structs, preloads, opts) do
+    structs
+    |> Enum.with_index()
+    |> Enum.group_by(&preload_group_key/1)
+    |> Enum.flat_map(fn
+      {nil, indexed_nil_values} ->
+        indexed_nil_values
+
+      {module, indexed_structs} ->
+        structs_for_module = Enum.map(indexed_structs, &elem(&1, 0))
+
+        loaded_structs =
+          Enum.reduce(preloads, structs_for_module, fn {association_name, nested_preloads}, acc ->
+            preload_association(repo, module, acc, association_name, nested_preloads, opts)
+          end)
+
+        loaded_structs
+        |> Enum.zip(Enum.map(indexed_structs, &elem(&1, 1)))
+        |> Enum.map(fn {struct, index} -> {struct, index} end)
+    end)
+    |> Enum.sort_by(&elem(&1, 1))
+    |> Enum.map(&elem(&1, 0))
+  end
+
+  defp preload_group_key({nil, _index}), do: nil
+  defp preload_group_key({%module{}, _index}) when is_atom(module), do: module
+
+  defp preload_group_key({value, _index}) do
+    raise ArgumentError,
+          "expected an Ector schema struct or nil in preload list, got: #{inspect(value)}"
+  end
+
+  @spec preload_association(module(), module(), [struct()], atom(), term(), Keyword.t()) :: [
+          struct()
+        ]
+  defp preload_association(repo, module, parents, association_name, nested_preloads, opts)
+       when is_atom(repo) and is_atom(module) and is_atom(association_name) do
+    unless ector_schema_module?(module) do
+      raise ArgumentError, "expected an Ector schema module, got: #{inspect(module)}"
+    end
+
+    association = association!(module, association_name)
+
+    unless ector_schema_module?(association.target) do
+      raise ArgumentError,
+            "expected Ector association #{inspect(module)}.#{association_name} to target an Ector schema, got: #{inspect(association.target)}"
+    end
+
+    case association.direction do
+      :outgoing ->
+        preload_edge_association(
+          repo,
+          parents,
+          association,
+          :source_id,
+          :target_id,
+          nested_preloads,
+          opts
+        )
+
+      :incoming ->
+        preload_incoming_association(repo, parents, association, nested_preloads, opts)
+    end
+  end
+
+  defp preload_edge_association(
+         repo,
+         parents,
+         association,
+         parent_edge_key,
+         target_edge_key,
+         nested_preloads,
+         opts
+       ) do
+    parent_ids = parents |> hidden_ids() |> Enum.uniq()
+
+    loaded_pairs =
+      if parent_ids == [] do
+        []
+      else
+        fetch_edge_targets(
+          repo,
+          association,
+          parent_ids,
+          parent_edge_key,
+          target_edge_key,
+          opts
+        )
+      end
+      |> preload_pair_targets(repo, nested_preloads, opts)
+
+    stitch_loaded_association(parents, association, loaded_pairs)
+  end
+
+  defp preload_incoming_association(repo, parents, association, nested_preloads, opts) do
+    {foreign_key_pairs, parents_without_foreign_key} = foreign_key_pairs(parents, association)
+
+    foreign_key_loaded_pairs =
+      repo
+      |> fetch_foreign_key_targets(association, foreign_key_pairs, opts)
+
+    foreign_key_parent_ids =
+      foreign_key_pairs
+      |> Enum.map(&elem(&1, 0))
+      |> MapSet.new()
+
+    loaded_parent_ids =
+      foreign_key_loaded_pairs
+      |> Enum.map(&elem(&1, 0))
+      |> MapSet.new()
+
+    unloaded_foreign_key_parents =
+      Enum.filter(parents, fn parent ->
+        parent_id = parent_hidden_id(parent)
+        parent_id in foreign_key_parent_ids and parent_id not in loaded_parent_ids
+      end)
+
+    fallback_parents = parents_without_foreign_key ++ unloaded_foreign_key_parents
+
+    fallback_parent_ids = fallback_parents |> hidden_ids() |> Enum.uniq()
+
+    edge_loaded_pairs =
+      if fallback_parent_ids == [] do
+        []
+      else
+        fetch_edge_targets(repo, association, fallback_parent_ids, :target_id, :source_id, opts)
+      end
+
+    (foreign_key_loaded_pairs ++ edge_loaded_pairs)
+    |> preload_pair_targets(repo, nested_preloads, opts)
+    |> then(&stitch_loaded_association(parents, association, &1))
+  end
+
+  defp fetch_edge_targets(repo, association, parent_ids, parent_edge_key, target_edge_key, opts) do
+    edge_label = edge_label_for(association)
+    target_label = association.target.__ector_label__()
+
+    query =
+      from(edge in Ector.Edge,
+        join: node in Ector.Node,
+        on:
+          field(node, :id) == field(edge, ^target_edge_key) and
+            field(node, :label) == ^target_label,
+        where:
+          field(edge, :label) == ^edge_label and
+            field(edge, ^parent_edge_key) in ^parent_ids,
+        order_by: [asc: field(edge, ^parent_edge_key), asc: node.id],
+        select: {field(edge, ^parent_edge_key), node}
+      )
+
+    repo.all(query, storage_opts(opts))
+    |> Enum.map(fn {parent_id, row} -> {parent_id, hydrate(association.target, row)} end)
+  end
+
+  defp fetch_foreign_key_targets(_repo, _association, [], _opts), do: []
+
+  defp fetch_foreign_key_targets(repo, association, foreign_key_pairs, opts) do
+    target_ids =
+      foreign_key_pairs
+      |> Enum.map(&elem(&1, 1))
+      |> Enum.uniq()
+
+    target_by_id =
+      from(node in Ector.Node,
+        where: node.label == ^association.target.__ector_label__() and node.id in ^target_ids,
+        select: node
+      )
+      |> repo.all(storage_opts(opts))
+      |> Enum.map(&hydrate(association.target, &1))
+      |> Map.new(&{&1.__id__, &1})
+
+    Enum.flat_map(foreign_key_pairs, fn {parent_id, target_id} ->
+      case Map.fetch(target_by_id, target_id) do
+        {:ok, target} -> [{parent_id, target}]
+        :error -> []
+      end
+    end)
+  end
+
+  defp preload_pair_targets([], _repo, _nested_preloads, _opts), do: []
+
+  defp preload_pair_targets(loaded_pairs, repo, nested_preloads, opts) do
+    case normalize_preloads(nested_preloads) do
+      [] ->
+        loaded_pairs
+
+      _normalized ->
+        parent_ids = Enum.map(loaded_pairs, &elem(&1, 0))
+        targets = Enum.map(loaded_pairs, &elem(&1, 1))
+
+        repo
+        |> preload(targets, nested_preloads, opts)
+        |> then(&Enum.zip(parent_ids, &1))
+    end
+  end
+
+  defp stitch_loaded_association(parents, association, loaded_pairs) do
+    grouped_targets =
+      loaded_pairs
+      |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+
+    Enum.map(parents, fn parent ->
+      parent_id = parent_hidden_id(parent)
+      targets = Map.get(grouped_targets, parent_id, [])
+
+      Map.put(parent, association.name, association_value(association, targets))
+    end)
+  end
+
+  defp association_value(%{cardinality: :many}, targets), do: targets
+  defp association_value(%{cardinality: :one}, [target | _targets]), do: target
+  defp association_value(%{cardinality: :one}, []), do: nil
+
+  defp foreign_key_pairs(parents, association) do
+    foreign_key = association_foreign_key(association)
+
+    Enum.reduce(parents, {[], []}, fn parent, {pairs, missing_parents} ->
+      parent_id = parent_hidden_id(parent)
+      target_id = Map.get(parent, foreign_key)
+
+      cond do
+        is_binary(parent_id) and parent_id != "" and valid_hidden_id?(target_id) ->
+          {[{parent_id, target_id} | pairs], missing_parents}
+
+        true ->
+          {pairs, [parent | missing_parents]}
+      end
+    end)
+    |> then(fn {pairs, missing_parents} ->
+      {Enum.reverse(pairs), Enum.reverse(missing_parents)}
+    end)
+  end
+
+  defp association_foreign_key(%{owner_key: owner_key}) when is_atom(owner_key), do: owner_key
+
+  defp association_foreign_key(%{opts: %{foreign_key: foreign_key}})
+       when is_atom(foreign_key) do
+    foreign_key
+  end
+
+  defp association_foreign_key(%{name: name}) when is_atom(name) do
+    :"#{name}_id"
+  end
+
+  defp hidden_ids(structs) do
+    structs
+    |> Enum.map(&parent_hidden_id/1)
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+  end
+
+  defp valid_hidden_id?(value) when is_binary(value) do
+    match?({:ok, _uuid}, Ecto.UUID.cast(value))
+  end
+
+  defp valid_hidden_id?(_value), do: false
+
+  defp parent_hidden_id(%{__id__: hidden_id}), do: hidden_id
+  defp parent_hidden_id(_struct), do: nil
+
+  defp association!(module, association_name) do
+    schema_association(module, association_name) ||
+      ector_association(module, association_name) ||
+      raise ArgumentError,
+            "unknown Ector association #{inspect(association_name)} for #{inspect(module)}"
+  end
+
+  defp schema_association(module, association_name) do
+    if function_exported?(module, :__schema__, 1) do
+      module
+      |> apply(:__schema__, [:association, association_name])
+      |> normalize_schema_association()
+    else
+      nil
+    end
+  rescue
+    FunctionClauseError -> nil
+  end
+
+  defp normalize_schema_association(nil), do: nil
+
+  defp normalize_schema_association(%Ecto.Association.BelongsTo{} = association) do
+    %{
+      cardinality: :one,
+      direction: :incoming,
+      name: association.field,
+      opts: %{},
+      owner: association.owner,
+      owner_key: association.owner_key,
+      target: association.related
+    }
+  end
+
+  defp normalize_schema_association(%Ecto.Association.Has{} = association) do
+    %{
+      cardinality: association.cardinality,
+      direction: :outgoing,
+      name: association.field,
+      opts: %{},
+      owner: association.owner,
+      owner_key: association.owner_key,
+      target: association.related
+    }
+  end
+
+  defp normalize_schema_association(_association), do: nil
+
+  defp ector_association(module, association_name) do
+    if function_exported?(module, :__ector_associations__, 0) do
+      module.__ector_associations__()
+      |> Enum.find(&(&1.name == association_name))
     end
   end
 

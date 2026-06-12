@@ -18,9 +18,9 @@ defmodule Ector.Changeset do
   @doc """
   Stores edge payload tuples under an association name on a changeset.
 
-  Each tuple is `{target_changeset, edge_properties}`. `Ector.Repo.insert/1`
-  uses the accumulated `__ector_edges__` metadata to insert the target node and
-  then materialize the connecting edge with the provided properties.
+  Each tuple is `{target_changeset, edge_properties}`. The Ector repo insert
+  wrapper uses the accumulated `__ector_edges__` metadata to insert the target
+  node and then materialize the connecting edge with the provided properties.
 
   ## Examples
 
