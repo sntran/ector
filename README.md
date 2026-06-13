@@ -11,7 +11,7 @@ In standard relational databases, handling highly dynamic data where products mi
 2. **The EAV Anti-Pattern:** A massive `Entity-Attribute-Value` table that destroys query performance and makes SQL joins unreadable.
 3. **The Schema-less Void:** Dumping everything into a JSON column and losing Ecto's powerful type-casting, validations, and compile-time guarantees.
 
-**Ector gives you the best of both worlds.** You define standard Elixir modules using `Ector.Node` and `Ector.Edge`. You use standard `Ecto.Changeset` to validate data. You query using standard `Ecto.Query`. But under the hood, Ector seamlessly compiles your domain into a high-performance, two-table JSONB storage engine (`nodes` and `edges`). 
+**Ector gives you the best of both worlds.** You define standard Elixir modules using `Ector.Node`, adding `Ector.Edge` only when a relationship needs its own properties. You use standard `Ecto.Changeset` to validate data. You query using standard `Ecto.Query`. But under the hood, Ector seamlessly compiles your domain into a high-performance, two-table JSONB storage engine (`nodes` and `edges`). 
 
 Add a new field to your schema? Just type it and deploy. Zero database migrations required.
 
@@ -20,7 +20,7 @@ Add a new field to your schema? Just type it and deploy. Zero database migration
 * **Pure Ecto Developer Experience:** If you know Ecto, you know Ector. It mirrors the exact APIs you are used to.
 * **Zero Migrations for Domain Entities:** Only one migration is needed to set up the core engine. After that, schemas are defined purely in application code.
 * **Identity Isolation:** You own your `id` field (e.g., Stripe ID, ERP ID). Ector manages the database topology silently using a hidden `__id__` (UUIDv7).
-* **Native Graph Preloading:** Use normal `Repo.preload/2` and `Repo.preload/3` syntax. Ector batches association hydration through the `edges` and `nodes` tables for `belongs_to`, `has_many`, and `has_one` without parent-by-parent N+1 queries.
+* **Native Graph Preloading:** Use normal `Repo.preload/2` and `Repo.preload/3` syntax. Ector batches association hydration through the `edges` and `nodes` tables for `belongs_to`, `has_many`, and `has_one` without parent-by-parent N+1 queries, including implicit associations with no custom edge module.
 * **Multi-Tenant Ready:** Native, zero-touch support for Ecto's `prefix` option across all queries and hidden joins.
 * **High Performance:** Leverages native UUIDv7 for time-ordered B-tree indexing, and fully supports PostgreSQL GIN indexing and SQLite binary JSON.
 * **Modern BEAM Power:** Built strictly for Elixir 1.20+ and Erlang 29+, utilizing gradual typing and the native C-backed `JSON` module for maximum throughput.
@@ -64,6 +64,8 @@ Ector operates across a few key boundaries to maintain the Ecto illusion:
 -   **AST Redirection:** `Ector.Query` macros (`from`, `where`, `select`) hygienically rewrite your Elixir AST at compile time. `u.status == "active"` is rewritten to Ecto's native dynamic JSON path syntax: `u.properties["status"] == "active"`.
 
 -   **Graph-Aware Preloading:** `Ector.Repo.preload/4` accepts standard Ecto preload shapes such as `:product`, `[:profile, :posts]`, and `[items: [offer: :product]]`. For `has_many` and `has_one`, it batches edge lookups by parent `__id__` and joins the target `nodes`. For `belongs_to`, it resolves JSON-stored UUIDv7 references directly and falls back to the edge topology when the domain field stores a business identifier. Hydrated structs are stitched back into the original association fields just like native Ecto preloads.
+
+-   **Implicit Edge Routing:** Associations can omit `through:` when the edge has no domain properties. Ector derives the physical edge label from the association name, still honoring custom edge modules or symbolic `through:` labels when supplied. Reverse `belongs_to` traversal infers the parent-side outgoing association label when no JSON UUID foreign key is present.
 
 -   **Adapter-Aware Bulk Mutations:** When running bulk `update_all` queries, `Ector.Repo` translates idiomatic Ecto update operators into database-specific JSON mutations without pulling records into memory. `set`, `inc`, and `push` all target the shared `properties` payload and compile through the adapter boundary.
 

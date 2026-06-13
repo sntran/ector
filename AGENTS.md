@@ -47,6 +47,12 @@ When a user writes `Ector.join(:carts, as: :cart)`, they are requesting a logica
 * This ensures subsequent `Ector.where([cart: c], ...)` clauses bind perfectly to the target node.
 * **Usage Boundary:** Use `Ector.join/3` when the query must filter, order, or project through an association. Use `Repo.preload/2` or `Repo.preload/3` when the query already has the boundary structs and only needs association hydration for display or context return values.
 
+### Implicit Edge Routing
+Associations no longer require custom edge modules or symbolic `through:` labels when the edge has no properties.
+* **Forward Lookup:** For `has_many` / `has_one`, derive the edge label from the association name unless `through:` names a custom `Ector.Edge` module or symbolic label.
+* **Reverse Lookup:** For `belongs_to` without a JSON UUID foreign key and without `through:`, infer the parent-side outgoing association label when exactly one matching parent association exists, then traverse `edges.target_id == child.__id__`.
+* **Rule:** Do not generate edge modules for property-less relationships. Edge modules are only warranted when the relationship itself owns domain fields.
+
 ### Preferred Association Hydration (Repo.preload)
 Display hydration should now use Ector's preload engine.
 * **Rule:** `Repo.preload` is the preferred method for hydrating Ector schema associations.

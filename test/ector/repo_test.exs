@@ -44,7 +44,6 @@ defmodule Ector.RepoTest do
 
     schema do
       field(:title, :string)
-      field(:user_id, Ecto.UUID)
 
       belongs_to(:user, Ector.RepoTest.User, through: :user_posts)
       has_many(:comments, Ector.RepoTest.Comment, through: :post_comments)
@@ -57,7 +56,6 @@ defmodule Ector.RepoTest do
 
     schema do
       field(:body, :string)
-      field(:post_id, Ecto.UUID)
 
       belongs_to(:post, Ector.RepoTest.Post, through: :post_comments)
     end
@@ -70,6 +68,26 @@ defmodule Ector.RepoTest do
       field(:bio, :string)
 
       belongs_to(:user, Ector.RepoTest.User, through: :user_profiles)
+    end
+  end
+
+  defmodule ImplicitParent do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+
+      has_many(:implicit_children, Ector.RepoTest.ImplicitChild)
+    end
+  end
+
+  defmodule ImplicitChild do
+    use Ector.Node
+
+    schema do
+      field(:title, :string)
+
+      belongs_to(:implicit_parent, Ector.RepoTest.ImplicitParent)
     end
   end
 
@@ -88,11 +106,11 @@ defmodule Ector.RepoTest do
 
     schema do
       field(:title, :string)
-      field(:business_parent_id, :string)
 
       belongs_to(:business_parent, Ector.RepoTest.BusinessParent,
         through: :business_posts,
-        foreign_key: :business_parent_id
+        foreign_key: :business_parent_id,
+        type: :string
       )
     end
   end
@@ -134,6 +152,74 @@ defmodule Ector.RepoTest do
       field(:name, :string)
 
       has_many(:carts, Cart, through: 123)
+    end
+  end
+
+  defmodule UserWithPlainTarget do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+
+      has_many(:widgets, Ector.RepoTest.PlainWidget)
+    end
+  end
+
+  defmodule NativeRepoChild do
+    use Ector.Node
+
+    schema do
+      field(:title, :string)
+      field(:native_repo_parent_id, Ecto.UUID)
+    end
+  end
+
+  defmodule NativeRepoParent do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+
+      Ecto.Schema.has_many(:native_children, NativeRepoChild,
+        foreign_key: :native_repo_parent_id,
+        references: :__id__
+      )
+    end
+  end
+
+  defmodule OrphanParent do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+    end
+  end
+
+  defmodule OrphanChild do
+    use Ector.Node
+
+    schema do
+      field(:title, :string)
+
+      belongs_to(:orphan_parent, OrphanParent)
+    end
+  end
+
+  defmodule ManyToManyTag do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+    end
+  end
+
+  defmodule ManyToManyArticle do
+    use Ector.Node
+
+    schema do
+      field(:title, :string)
+
+      Ecto.Schema.many_to_many(:tags, ManyToManyTag, join_through: "articles_tags")
     end
   end
 
@@ -308,6 +394,34 @@ defmodule Ector.RepoTest do
     assert user_id == user.__id__
   end
 
+  test "preload/4 hydrates associations without a custom through edge module" do
+    repo = Ector.TestRepo.repo_module()
+
+    child =
+      ImplicitChild.changeset(%ImplicitChild{}, %{
+        "id" => "implicit-child",
+        "title" => "Implicit edge"
+      })
+
+    parent =
+      ImplicitParent.changeset(%ImplicitParent{}, %{
+        "id" => "implicit-parent",
+        "name" => "Parent"
+      })
+      |> Ector.Changeset.put_edge(:implicit_children, [{child, %{}}])
+
+    assert {:ok, %ImplicitParent{} = inserted_parent} = repo.insert(parent)
+
+    loaded_parent = Ector.Repo.preload(repo, inserted_parent, :implicit_children)
+
+    assert [%ImplicitChild{id: "implicit-child"}] = loaded_parent.implicit_children
+    assert Ector.TestRepo.query!("SELECT label FROM edges").rows == [["IMPLICIT_CHILDREN"]]
+
+    loaded_child = Ector.Repo.preload(repo, repo.one(ImplicitChild), :implicit_parent)
+
+    assert %ImplicitParent{id: "implicit-parent"} = loaded_child.implicit_parent
+  end
+
   test "preload/4 falls back to graph edges when a belongs_to field stores a business id" do
     repo = Ector.TestRepo.repo_module()
 
@@ -342,11 +456,163 @@ defmodule Ector.RepoTest do
 
     assert Ector.Repo.preload(repo, nil, :posts) == nil
     assert Ector.Repo.preload(repo, [], :posts) == []
+    assert Ector.Repo.preload(repo, [nil], :posts) == [nil]
 
     loaded = Ector.Repo.preload(repo, no_posts, [:posts, :profile])
 
     assert loaded.posts == []
     assert loaded.profile == nil
+  end
+
+  test "preload public guards reject unsupported inputs" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert Ector.Repo.preloadable?(nil)
+    assert Ector.Repo.preloadable?([])
+    assert Ector.Repo.preloadable?(%User{})
+    assert Ector.Repo.preloadable?([nil, %User{}])
+    refute Ector.Repo.preloadable?([%User{}, %PlainWidget{}])
+    refute Ector.Repo.preloadable?([%User{}, :not_a_struct])
+    refute Ector.Repo.preloadable?(%PlainWidget{})
+    refute Ector.Repo.preloadable?(:not_a_struct)
+
+    assert Ector.Repo.preload(repo, %User{id: "empty"}, []) == %User{id: "empty"}
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Ector.Repo.preload(repo, %PlainWidget{}, :posts)
+      end
+
+    assert Exception.message(error) =~ "expected an Ector schema module"
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Ector.Repo.preload(repo, :not_a_struct, :posts)
+      end
+
+    assert Exception.message(error) =~ "expected an Ector schema struct"
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Ector.Repo.preload(repo, [%User{}, :not_a_struct], :posts)
+      end
+
+    assert Exception.message(error) =~ "expected an Ector schema struct or nil in preload list"
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Ector.Repo.preload(repo, %User{}, :unknown)
+      end
+
+    assert Exception.message(error) =~ "unknown Ector association :unknown"
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Ector.Repo.preload(repo, %ManyToManyArticle{}, :tags)
+      end
+
+    assert Exception.message(error) =~ "unknown Ector association :tags"
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Ector.Repo.preload(repo, %UserWithPlainTarget{}, :widgets)
+      end
+
+    assert Exception.message(error) =~ "to target an Ector schema"
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Ector.Repo.preload(repo, %User{}, [123])
+      end
+
+    assert Exception.message(error) =~ "unsupported Ector preload expression"
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Ector.Repo.preload(repo, %User{}, 123)
+      end
+
+    assert Exception.message(error) =~ "unsupported Ector preload expression"
+  end
+
+  test "preload/4 handles missing ids native has_many metadata and JSON foreign-key misses" do
+    repo = Ector.TestRepo.repo_module()
+
+    missing_parent_loaded =
+      Ector.Repo.preload(repo, %User{id: "missing-parent-id", __id__: nil}, :posts)
+
+    assert Map.fetch!(missing_parent_loaded, :posts) == []
+
+    native_parent = %NativeRepoParent{
+      id: "native-parent",
+      __id__: Ecto.UUID.autogenerate(version: 7, precision: :monotonic)
+    }
+
+    native_parent_loaded = Ector.Repo.preload(repo, native_parent, :native_children)
+
+    assert Map.fetch!(native_parent_loaded, :native_children) == []
+
+    assert {:ok, %ImplicitParent{} = direct_parent} =
+             repo.insert(
+               ImplicitParent.changeset(%ImplicitParent{}, %{
+                 "id" => "direct-parent",
+                 "name" => "Direct"
+               })
+             )
+
+    assert {:ok, %ImplicitChild{} = direct_child} =
+             repo.insert(
+               ImplicitChild.changeset(%ImplicitChild{}, %{
+                 "id" => "direct-child",
+                 "title" => "Direct FK",
+                 "implicit_parent_id" => direct_parent.__id__
+               })
+             )
+
+    direct_parent_loaded = Ector.Repo.preload(repo, direct_parent, :implicit_children)
+
+    assert [%ImplicitChild{id: "direct-child"}] =
+             Map.fetch!(direct_parent_loaded, :implicit_children)
+
+    missing_target =
+      %ImplicitChild{
+        id: "missing-target",
+        __id__: Ecto.UUID.autogenerate(version: 7, precision: :monotonic),
+        implicit_parent_id: Ecto.UUID.autogenerate(version: 7, precision: :monotonic)
+      }
+
+    assert %ImplicitChild{implicit_parent: nil} =
+             Ector.Repo.preload(repo, missing_target, :implicit_parent)
+
+    assert %ImplicitChild{implicit_parent: %ImplicitParent{id: "direct-parent"}} =
+             Ector.Repo.preload(repo, direct_child, :implicit_parent)
+  end
+
+  test "preload/4 resolves incoming implicit edges when no inverse association exists" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert {:ok, %OrphanParent{} = parent} =
+             repo.insert(
+               OrphanParent.changeset(%OrphanParent{}, %{id: "orphan-parent", name: "Ada"})
+             )
+
+    assert {:ok, %OrphanChild{} = child} =
+             repo.insert(
+               OrphanChild.changeset(%OrphanChild{}, %{id: "orphan-child", title: "Notes"})
+             )
+
+    edge_row = %{
+      id: Ecto.UUID.autogenerate(version: 7, precision: :monotonic),
+      label: "ORPHAN_PARENT",
+      source_id: parent.__id__,
+      target_id: child.__id__,
+      properties: encoded_properties(%{})
+    }
+
+    assert {1, nil} = repo.insert_all(edge_insert_target(), [edge_row])
+
+    assert %OrphanChild{orphan_parent: %OrphanParent{id: "orphan-parent"}} =
+             Ector.Repo.preload(repo, child, :orphan_parent)
   end
 
   test "insert/2 persists source target and routing edge rows" do
@@ -556,6 +822,17 @@ defmodule Ector.RepoTest do
     assert [] =
              Ector.Repo.all(repo, nil_source_query, [], fn executable_query, _opts ->
                assert executable_query.from.source == {"nodes", Ector.Node}
+               []
+             end)
+
+    select_without_params_query =
+      User
+      |> Ector.Query.from()
+      |> query_with_select_without_params({{:., [], [{:&, [], [0]}, :__id__]}, [], []})
+
+    assert [] =
+             Ector.Repo.all(repo, select_without_params_query, [], fn executable_query, _opts ->
+               assert hidden_id_field_access?(executable_query.select.expr)
                []
              end)
 
@@ -806,6 +1083,53 @@ defmodule Ector.RepoTest do
 
     assert %User{name: "Updated", visits: 4, tags: ["seed", "repo-first", "pipe"]} =
              repo.one(User)
+  end
+
+  test "direct update_all/4 falls back for standard queryables and rejects invalid arguments" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert {1, nil} = repo.insert_all(PlainWidget, [%{id: "plain-update-all", name: "Plain"}])
+
+    assert {1, nil} =
+             Ector.Repo.update_all(repo, PlainWidget, set: [name: "Renamed"])
+
+    assert %PlainWidget{name: "Renamed"} = repo.one(PlainWidget)
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Ector.Repo.update_all(:not_a_repo, User, set: [name: "Updated"])
+      end
+
+    assert Exception.message(error) =~ "expected an Ecto repo module plus an Ector queryable"
+  end
+
+  test "update_all/5 validates property update field and value shapes" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert {:rewritten, [set: [properties: %Ecto.Query.DynamicExpr{}]]} =
+             Ector.Repo.update_all(
+               repo,
+               User,
+               [set: [{"nickname", "Ada"}]],
+               [],
+               fn _query, updates, _opts -> {:rewritten, updates} end
+             )
+
+    invalid_updates = [
+      [inc: [visits: "many"]],
+      [set: [{123, "bad"}]],
+      [set: [{"", "bad"}]],
+      [set: [:not_a_tuple]]
+    ]
+
+    for updates <- invalid_updates do
+      assert {:fallback, ^updates} =
+               Ector.Repo.update_all(repo, User, updates, [], fn _queryable,
+                                                                 fallback_updates,
+                                                                 _opts ->
+                 {:fallback, fallback_updates}
+               end)
+    end
   end
 
   test "delete/2 rejects structs with missing or stale routing ids" do
@@ -1098,6 +1422,10 @@ defmodule Ector.RepoTest do
     if Ector.TestRepo.sqlite?(), do: Ector.Node.__schema__(:source), else: Ector.Node
   end
 
+  defp edge_insert_target do
+    if Ector.TestRepo.sqlite?(), do: Ector.Edge.__schema__(:source), else: Ector.Edge
+  end
+
   defp encoded_properties(properties) do
     if Ector.TestRepo.sqlite?(), do: Ector.Translator.encode_json!(properties), else: properties
   end
@@ -1107,6 +1435,10 @@ defmodule Ector.RepoTest do
       {{:., _dot_meta, [{:&, _binding_meta, [_binding_index]}, :id]}, _call_meta, []} -> true
       _other -> false
     end)
+  end
+
+  defp query_with_select_without_params(%Ecto.Query{} = query, expr) do
+    %{query | select: %{expr: expr}}
   end
 
   defp ast_contains?(ast, predicate) when is_function(predicate, 1) do

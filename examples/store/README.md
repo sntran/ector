@@ -81,6 +81,13 @@ Offer
 |> Repo.preload(:product)
 ```
 
+The store intentionally mirrors a standard Ecto join-table setup for cart
+lines. `Store.Checkout.CartItem` is a normal node with `belongs_to :cart` and
+`belongs_to :offer`, and it owns the line-specific `quantity` and
+`price_at_addition` fields. Ector turns those ordinary associations into
+implicit graph edges, so the example stays close to a legacy Ecto application
+while still using the shared `nodes` and `edges` storage engine.
+
 ### Single-Cursor Bidirectional Pagination
 
 The LiveView catalog uses one public query parameter: `?cursor=token`. The token
@@ -96,19 +103,18 @@ is a URL-safe Base64 envelope containing the storage cursor and direction:
 The decoded `dir` drives whether the query asks for the next or previous page.
 No split `after` / `before` URL state is required.
 
-### Four-Hop Cart Summary
+### Implicit CartItem Cart Summary
 
-Checkout fetches the selected `Cart` by business id, then hydrates the read
-model through nested Ector preloads:
+Checkout fetches the selected `Cart` by business id and uses a standard nested
+preload to hydrate the visible cart-line graph:
 
 ```elixir
 cart
 |> Repo.preload(items: [offer: :product])
 ```
 
-That resolves `Cart -> CartItem -> Offer -> Product` while preserving the
-normal `@cart.items`, `item.offer`, and `item.offer.product.images` shape that
-LiveView templates expect.
+That resolves `Cart -> CartItem -> Offer -> Product` through Ector's implicit
+edge routing without adding any storefront-specific relationship module.
 
 ### Atomic Flash Sale Checkout
 
@@ -145,7 +151,8 @@ The integration suite resets and migrates one Ector repo, then asserts:
   staying scoped to the `Offer` label;
 * offer listing uses denormalized Offer text and cursor pagination over
   descending `__id__`;
-* cart summaries preload `Cart -> CartItem -> Offer -> Product`; and
+* cart summaries read `Cart -> CartItem -> Offer -> Product` through a standard
+  nested preload; and
 * checkout decrements stock atomically with `inc: [quantity: -quantity]` before
   converting the cart.
 

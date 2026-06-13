@@ -12,7 +12,7 @@ only happen in a major release and are documented in the [CHANGELOG](CHANGELOG.m
 | Module | What you depend on |
 |--------|--------------------|
 | `Ector` | The query façade macros (`from`, `where`, `select`, `join`, …). |
-| `Ector.Node` / `Ector.Edge` | The `use` macro, `schema do … end`, and the `has_many`/`has_one`/`belongs_to` association DSL. |
+| `Ector.Node` / `Ector.Edge` | The `use` macro, `schema do … end`, preserved `schema "table" do … end` forms, and the `has_many`/`has_one`/`belongs_to` association DSL. |
 | `Ector.Changeset` | `put_edge/3` and the tuple-payload shape. |
 | `Ector.Repo` | The `use Ector.Repo` macro and the overridden `Ecto.Repo` callbacks (`all`, `one`, `insert`, `update`, `delete`, `delete_all`, `update_all`, `preload`). |
 | `Ector.Migration` | `use Ector.Migration`, `up/1`, `down/1`, and the smart `index/3`. |
@@ -33,7 +33,8 @@ In practical terms:
 - `set`, `inc`, and `push` bulk updates are translated into adapter-native JSON
   expressions; and
 - `belongs_to`, `has_many`, and `has_one` preloads batch graph traversal through
-  the `edges` and `nodes` tables.
+  the `edges` and `nodes` tables, including implicit associations with no custom
+  edge module.
 
 ### Stable reflection
 

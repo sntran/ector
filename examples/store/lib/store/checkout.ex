@@ -10,7 +10,6 @@ defmodule Store.Checkout do
   alias Store.Catalog.Offer
   alias Store.Checkout.{Cart, CartItem}
   alias Store.Repo
-  alias Store.Storage
 
   alias Ecto.Multi
 
@@ -113,41 +112,29 @@ defmodule Store.Checkout do
   end
 
   defp insert_cart_item!(cart, offer, quantity) do
-    item_storage_id = Storage.uuidv7()
-    item_id = Storage.uuidv7()
+    attrs = %{
+      id: business_id(),
+      cart_id: cart.__id__,
+      offer_id: offer.__id__,
+      quantity: quantity,
+      price_at_addition: offer.price
+    }
 
-    Storage.insert_nodes!([
-      Storage.node_row(
-        CartItem,
-        %{
-          id: item_id,
-          quantity: quantity,
-          price_at_addition: offer.price
-        },
-        item_storage_id
-      )
-    ])
-
-    Storage.insert_edges!([
-      Storage.edge_row(Storage.edge_label!(Cart, :items), cart.__id__, item_storage_id),
-      Storage.edge_row(Storage.edge_label!(Offer, :cart_items), offer.__id__, item_storage_id)
-    ])
+    %CartItem{}
+    |> CartItem.changeset(attrs)
+    |> insert!("cart item")
   end
 
   defp merge_cart_items!([primary | duplicates], added_quantity) do
     total_quantity =
       primary.quantity + added_quantity + Enum.reduce(duplicates, 0, &(&1.quantity + &2))
 
-    CartItem
-    |> Ector.from()
-    |> Ector.where([item], item.__id__ == ^primary.__id__)
-    |> Repo.update_all(set: [quantity: total_quantity])
+    primary
+    |> CartItem.changeset(%{quantity: total_quantity})
+    |> update!("cart item")
 
     Enum.each(duplicates, fn item ->
-      CartItem
-      |> Ector.from()
-      |> Ector.where([cart_item], cart_item.__id__ == ^item.__id__)
-      |> Repo.delete_all()
+      Repo.delete(item)
     end)
   end
 
@@ -155,11 +142,10 @@ defmodule Store.Checkout do
   @spec update_cart_item_quantity(String.t(), String.t(), pos_integer()) :: cart_summary() | nil
   def update_cart_item_quantity(cart_id, item_id, quantity)
       when is_binary(cart_id) and is_binary(item_id) and is_integer(quantity) and quantity > 0 do
-    with %{__id__: item_storage_id} <- get_cart_item_for_cart(cart_id, item_id) do
-      CartItem
-      |> Ector.from()
-      |> Ector.where([item], item.__id__ == ^item_storage_id)
-      |> Repo.update_all(set: [quantity: quantity])
+    with %CartItem{} = item <- get_cart_item_for_cart(cart_id, item_id) do
+      item
+      |> CartItem.changeset(%{quantity: quantity})
+      |> Repo.update()
     end
 
     get_cart_summary(cart_id)
@@ -168,11 +154,8 @@ defmodule Store.Checkout do
   @doc "Removes a cart item when the item belongs to the cart."
   @spec remove_cart_item(String.t(), String.t()) :: cart_summary() | nil
   def remove_cart_item(cart_id, item_id) when is_binary(cart_id) and is_binary(item_id) do
-    with %{__id__: item_storage_id} <- get_cart_item_for_cart(cart_id, item_id) do
-      CartItem
-      |> Ector.from()
-      |> Ector.where([item], item.__id__ == ^item_storage_id)
-      |> Repo.delete_all()
+    with %CartItem{} = item <- get_cart_item_for_cart(cart_id, item_id) do
+      Repo.delete(item)
     end
 
     get_cart_summary(cart_id)
@@ -323,16 +306,19 @@ defmodule Store.Checkout do
   end
 
   defp checkout_stock_lines(cart_id) do
-    Cart
-    |> Ector.from()
-    |> Ector.join(:items, as: :item)
-    |> Ector.join(:offer, as: :offer, from: :item)
-    |> Ector.where([cart], cart.id == ^cart_id and cart.status == ^"active")
-    |> Ector.select([cart, item: item, offer: offer], %{
-      offer_id: offer.id,
-      quantity: item.quantity
-    })
-    |> Repo.all()
+    case get_cart(cart_id) do
+      %{status: "active"} = cart ->
+        cart
+        |> cart_items_for_cart()
+        |> Repo.preload(:offer)
+        |> Enum.map(fn item ->
+          offer = loaded_association!(item, :offer)
+          %{offer_id: offer.id, quantity: item.quantity}
+        end)
+
+      _missing_or_inactive ->
+        []
+    end
   end
 
   defp aggregate_stock_lines(lines) do
@@ -370,47 +356,28 @@ defmodule Store.Checkout do
   end
 
   defp get_cart_items_for_offer(cart_storage_id, offer_storage_id) do
-    Cart
+    CartItem
     |> Ector.from()
-    |> Ector.join(:items, as: :item)
-    |> Ector.join(:offer, as: :offer, from: :item)
     |> Ector.where(
-      [cart, offer: offer],
-      cart.__id__ == ^cart_storage_id and offer.__id__ == ^offer_storage_id
+      [item],
+      item.cart_id == ^cart_storage_id and item.offer_id == ^offer_storage_id
     )
-    |> Ector.select([cart, item: item, offer: offer], %{
-      id: item.id,
-      __id__: item.__id__,
-      quantity: item.quantity,
-      price_at_addition: item.price_at_addition
-    })
     |> Repo.all()
     |> Enum.sort_by(& &1.__id__)
   end
 
   defp get_cart_item_for_cart(cart_id, item_id) do
-    Cart
-    |> Ector.from()
-    |> Ector.join(:items, as: :item)
-    |> Ector.where([cart], cart.id == ^cart_id)
-    |> Ector.select([cart, item: item], %{
-      id: item.id,
-      __id__: item.__id__,
-      quantity: item.quantity,
-      price_at_addition: item.price_at_addition
-    })
-    |> Repo.all()
-    |> Enum.find(&(&1.id == item_id))
+    with %Cart{} = cart <- get_cart(cart_id) do
+      cart
+      |> cart_items_for_cart()
+      |> Enum.find(&(&1.id == item_id))
+    end
   end
 
   defp insert_cart!(cart_id) do
-    storage_id = Storage.uuidv7()
-
-    Storage.insert_nodes!([
-      Storage.node_row(Cart, %{id: cart_id, status: "active"}, storage_id)
-    ])
-
-    %Cart{id: cart_id, __id__: storage_id, status: "active"}
+    %Cart{}
+    |> Cart.changeset(%{id: cart_id, status: "active"})
+    |> insert!("cart")
   end
 
   defp get_offer_node!(offer_id) do
@@ -424,5 +391,38 @@ defmodule Store.Checkout do
       nil -> raise ArgumentError, "unknown offer #{inspect(offer_id)}"
       offer -> offer
     end
+  end
+
+  defp cart_items_for_cart(%Cart{__id__: cart_storage_id}) when is_binary(cart_storage_id) do
+    CartItem
+    |> Ector.from()
+    |> Ector.where([item], item.cart_id == ^cart_storage_id)
+    |> Repo.all()
+    |> Enum.sort_by(& &1.id)
+  end
+
+  defp cart_items_for_cart(_cart), do: []
+
+  defp business_id do
+    Ecto.UUID.generate(version: 7, precision: :monotonic)
+  end
+
+  defp insert!(changeset, label) do
+    case Repo.insert(changeset) do
+      {:ok, struct} -> struct
+      {:error, changeset} -> raise_invalid_changeset!(label, changeset)
+    end
+  end
+
+  defp update!(changeset, label) do
+    case Repo.update(changeset) do
+      {:ok, struct} -> struct
+      {:error, changeset} -> raise_invalid_changeset!(label, changeset)
+    end
+  end
+
+  defp raise_invalid_changeset!(label, changeset) do
+    raise ArgumentError,
+          "invalid #{label}: #{inspect(changeset.errors)}"
   end
 end

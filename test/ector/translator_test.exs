@@ -218,6 +218,18 @@ defmodule Ector.TranslatorTest do
              {-1, :integer}
            ] = params
 
+    assert {sql, params} = expanded_translator_output(FakePostgresRepo, inc: [ratio: 1.5])
+
+    assert sql =~ "double precision"
+
+    assert [
+             {%Ecto.Query.DynamicExpr{}, :any},
+             {["ratio"], {:array, :string}},
+             {%Ecto.Query.DynamicExpr{}, :any},
+             {["ratio"], {:array, :string}},
+             {1.5, :float}
+           ] = params
+
     assert {sql, params} = expanded_translator_output(FakePostgresRepo, push: [tags: "sale"])
 
     assert sql =~ "jsonb_set"

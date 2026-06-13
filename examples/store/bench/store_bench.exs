@@ -25,7 +25,7 @@ bench_opts = [
 
 product_offer_label = Storage.edge_label!(Product, :offers)
 cart_item_label = Storage.edge_label!(Cart, :items)
-offer_item_label = Storage.edge_label!(Offer, :cart_items)
+offer_cart_item_label = Storage.edge_label!(Offer, :cart_items)
 
 build_rows = fn count ->
   product_offer_pairs =
@@ -85,7 +85,13 @@ build_rows = fn count ->
         row:
           Storage.node_row(
             CartItem,
-            %{id: "bench-item-#{i}", quantity: i, price_at_addition: 1_000 + i},
+            %{
+              id: "bench-item-#{i}",
+              cart_id: cart_storage_id,
+              offer_id: pair.offer_storage_id,
+              quantity: i,
+              price_at_addition: 1_000 + i
+            },
             item_storage_id
           )
       }
@@ -93,7 +99,7 @@ build_rows = fn count ->
 
   nodes =
     Enum.flat_map(product_offer_pairs, &[&1.product, &1.offer]) ++
-      [cart | Enum.map(cart_items, & &1.row)]
+      [cart] ++ Enum.map(cart_items, & &1.row)
 
   edges =
     Enum.map(product_offer_pairs, fn pair ->
@@ -102,7 +108,7 @@ build_rows = fn count ->
       Enum.flat_map(cart_items, fn item ->
         [
           Storage.edge_row(cart_item_label, cart_storage_id, item.storage_id),
-          Storage.edge_row(offer_item_label, item.offer_storage_id, item.storage_id)
+          Storage.edge_row(offer_cart_item_label, item.offer_storage_id, item.storage_id)
         ]
       end)
 
@@ -137,7 +143,7 @@ Benchee.run(
          seed.(n)
          Catalog.list_offers(limit: 50, search: "product").next_cursor
        end},
-    "4-hop preload cart summary" =>
+    "implicit CartItem cart summary" =>
       {fn _input -> Checkout.get_cart_summary("bench-cart") end,
        before_each: fn _input -> seed.(n) end}
   },

@@ -33,7 +33,7 @@ end
 adapter behavior while teaching `all`, `one`, `insert`, `update`, `delete`,
 `delete_all`, and `update_all` to speak Ector's storage shape.
 
-## 3. Define nodes and edges
+## 3. Define nodes and associations
 
 You own your business identifier (`id`). Ector tracks topology with a hidden
 `__id__` (UUIDv7) so your IDs are never overwritten.
@@ -46,7 +46,7 @@ defmodule MyApp.Customer do
     field :email, :string
     field :name, :string
 
-    has_many :carts, MyApp.Cart, through: :has_cart
+    has_many :carts, MyApp.Cart
   end
 end
 
@@ -58,6 +58,11 @@ defmodule MyApp.Cart do
   end
 end
 ```
+
+When an association does not need edge properties, omit `through:` and Ector
+will route it through the generic `edges` table using the association name as
+the edge label. Add a symbolic `through:` label or an `Ector.Edge` module only
+when you need a stable custom label or edge-specific fields.
 
 Add a new field whenever your domain changes — **no database migration
 required.**

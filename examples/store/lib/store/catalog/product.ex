@@ -19,7 +19,7 @@ defmodule Store.Catalog.Product do
     field(:description, :string)
     field(:images, {:array, :string}, default: [])
 
-    has_many(:offers, Offer, through: :product_offers)
+    has_many(:offers, Offer)
   end
 
   @type t :: %__MODULE__{

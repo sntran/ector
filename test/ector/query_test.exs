@@ -46,6 +46,38 @@ defmodule Ector.QueryTest do
     end
   end
 
+  defmodule ForwardQuery do
+    require Ector.Query
+
+    def query do
+      Ector.Query.from(target in Ector.QueryTest.ForwardTarget)
+    end
+  end
+
+  defmodule ForwardTarget do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+    end
+  end
+
+  defmodule BareForwardQuery do
+    require Ector.Query
+
+    def query do
+      Ector.Query.from(Ector.QueryTest.BareForwardTarget)
+    end
+  end
+
+  defmodule BareForwardTarget do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+    end
+  end
+
   defmodule IncomingUser do
     use Ector.Node
 
@@ -77,6 +109,74 @@ defmodule Ector.QueryTest do
 
     schema do
       has_many(:line_items, Cart)
+    end
+  end
+
+  defmodule OrphanParent do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+    end
+  end
+
+  defmodule OrphanChild do
+    use Ector.Node
+
+    schema do
+      belongs_to(:orphan_parent, OrphanParent)
+    end
+  end
+
+  defmodule NativeTarget do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+      field(:native_has_parent_id, Ecto.UUID)
+    end
+  end
+
+  defmodule NativeHasParent do
+    use Ector.Node
+
+    schema do
+      Ecto.Schema.has_many(:native_targets, NativeTarget,
+        foreign_key: :native_has_parent_id,
+        references: :__id__
+      )
+    end
+  end
+
+  defmodule ManyToManyTag do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+    end
+  end
+
+  defmodule ManyToManyArticle do
+    use Ector.Node
+
+    schema do
+      Ecto.Schema.many_to_many(:tags, ManyToManyTag, join_through: "articles_tags")
+    end
+  end
+
+  defmodule ImplicitParent do
+    use Ector.Node
+
+    schema do
+      has_many(:implicit_children, Ector.QueryTest.ImplicitChild)
+    end
+  end
+
+  defmodule ImplicitChild do
+    use Ector.Node
+
+    schema do
+      belongs_to(:implicit_parent, Ector.QueryTest.ImplicitParent)
     end
   end
 
@@ -139,6 +239,11 @@ defmodule Ector.QueryTest do
     assert bare_query.from.source == {"nodes", User}
     assert [%Ecto.Query.BooleanExpr{}] = bare_query.wheres
 
+    bare_plain_query = Ector.Query.from(PlainSchema)
+
+    assert bare_plain_query.from.source == {"plain_schemas", PlainSchema}
+    assert bare_plain_query.wheres == []
+
     plain_query = Ector.Query.from(plain in PlainSchema, where: plain.status == "active")
 
     assert plain_query.from.source == {"plain_schemas", PlainSchema}
@@ -153,6 +258,22 @@ defmodule Ector.QueryTest do
 
     assert bare_string_query.from.source == {"plain_schemas", nil}
     assert bare_string_query.wheres == []
+  end
+
+  test "from/1 defers Ector schema detection for forward module references" do
+    query = ForwardQuery.query()
+
+    assert query.from.source == {"nodes", ForwardTarget}
+    assert [%Ecto.Query.BooleanExpr{} = label_filter] = query.wheres
+    assert label_filter.params == [{"ForwardTarget", {0, :label}}]
+  end
+
+  test "from/1 defers Ector schema detection for bare forward module references" do
+    query = BareForwardQuery.query()
+
+    assert query.from.source == {"nodes", BareForwardTarget}
+    assert [%Ecto.Query.BooleanExpr{} = label_filter] = query.wheres
+    assert label_filter.params == [{"BareForwardTarget", {0, :label}}]
   end
 
   test "from/1 supports list-shaped binding ASTs" do
@@ -440,9 +561,28 @@ defmodule Ector.QueryTest do
         __ENV__
       )
     end
+
+    assert_raise ArgumentError, ~r/`from:` to be a compile time atom alias/, fn ->
+      Code.eval_quoted(
+        quote do
+          require Ector.Query
+          Ector.Query.join(unquote(Macro.escape(query)), :carts, as: :cart, from: "root")
+        end,
+        [],
+        __ENV__
+      )
+    end
   end
 
   test "join/3 can continue from a previous named target binding" do
+    root_joined =
+      Ector.Query.from(u in User, as: :root)
+      |> Ector.Query.join(:carts, as: :cart, from: :root)
+
+    assert [root_edge_join, root_target_join] = root_joined.joins
+    assert join_field_comparison?(root_edge_join.on.expr, 1, :source_id, 0, :__id__)
+    assert root_target_join.as == :cart
+
     joined =
       ChainCart
       |> Ector.Query.from()
@@ -479,6 +619,13 @@ defmodule Ector.QueryTest do
       |> Ector.Query.from()
       |> Ector.Query.join(:offer, as: :offer, from: :missing)
     end
+
+    assert_raise ArgumentError, ~r/unknown Ector join source alias :ghost/, fn ->
+      User
+      |> Ector.Query.from()
+      |> Map.put(:aliases, %{ghost: 99})
+      |> Ector.Query.join(:carts, as: :cart, from: :ghost)
+    end
   end
 
   test "join/3 validates associations and Ector query sources" do
@@ -498,6 +645,10 @@ defmodule Ector.QueryTest do
       Ector.Query.join(%Ecto.Query{from: %Ecto.Query.FromExpr{source: "plain"}}, :carts,
         as: :cart
       )
+    end
+
+    assert_raise ArgumentError, ~r/expected an Ector query source, got: nil/, fn ->
+      Ector.Query.join(%Ecto.Query{}, :carts, as: :cart)
     end
   end
 
@@ -522,10 +673,42 @@ defmodule Ector.QueryTest do
       "LINE_ITEMS"
     )
 
+    assert_join_edge_label(
+      OrphanChild |> Ector.Query.from() |> Ector.Query.join(:orphan_parent, as: :parent),
+      "ORPHAN_PARENT"
+    )
+
+    assert_join_edge_label(
+      NativeHasParent
+      |> Ector.Query.from()
+      |> Ector.Query.join(:native_targets, as: :native_target),
+      "NATIVE_TARGETS"
+    )
+
+    assert_join_edge_label(
+      ImplicitParent
+      |> Ector.Query.from()
+      |> Ector.Query.join(:implicit_children, as: :child),
+      "IMPLICIT_CHILDREN"
+    )
+
+    assert_join_edge_label(
+      ImplicitChild
+      |> Ector.Query.from()
+      |> Ector.Query.join(:implicit_parent, as: :parent),
+      "IMPLICIT_CHILDREN"
+    )
+
     assert_raise ArgumentError, ~r/unsupported Ector edge label source/, fn ->
       InvalidThroughUser
       |> Ector.Query.from()
       |> Ector.Query.join(:invalid_carts, as: :cart)
+    end
+
+    assert_raise ArgumentError, ~r/unknown Ector association :tags/, fn ->
+      ManyToManyArticle
+      |> Ector.Query.from()
+      |> Ector.Query.join(:tags, as: :tag)
     end
   end
 

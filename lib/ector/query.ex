@@ -31,12 +31,33 @@ defmodule Ector.Query do
       {:ok, rewritten_expr, label_binding, module} ->
         label_var = Macro.unique_var(:ector_label, __MODULE__)
         label_filter = label_filter_ast(label_binding, label_var)
-        opts_with_label = [{:where, label_filter} | rewritten_opts]
+        opts_with_label = opts_with_label_filter(rewritten_opts, label_filter)
 
         quote do
           require Ecto.Query
           unquote(label_var) = unquote(module.__ector_label__())
           Ecto.Query.from(unquote(rewritten_expr), unquote(opts_with_label))
+        end
+
+      {:defer, deferred_expr, label_binding, module} ->
+        source_var = Macro.unique_var(:ector_source, __MODULE__)
+        label_var = Macro.unique_var(:ector_label, __MODULE__)
+        label_filter = label_filter_ast(label_binding, label_var)
+        opts_with_label = opts_with_label_filter(rewritten_opts, label_filter)
+        rewritten_expr = put_deferred_source(deferred_expr, source_var)
+
+        quote do
+          require Ecto.Query
+
+          if Ector.Query.__ector_schema_module__(unquote(module)) do
+            unquote(source_var) =
+              {unquote(module).__ector_table__() |> Atom.to_string(), unquote(module)}
+
+            unquote(label_var) = unquote(module).__ector_label__()
+            Ecto.Query.from(unquote(rewritten_expr), unquote(opts_with_label))
+          else
+            Ecto.Query.from(unquote(expr), unquote(rewritten_opts))
+          end
         end
 
       :error ->
@@ -199,8 +220,10 @@ defmodule Ector.Query do
 
       :error ->
         if is_nil(source_alias) do
+          source = if query.from, do: query.from.source, else: nil
+
           raise ArgumentError,
-                "expected an Ector query source, got: #{inspect(query.from.source)}"
+                "expected an Ector query source, got: #{inspect(source)}"
         else
           raise ArgumentError,
                 "unknown Ector join source alias #{inspect(source_alias)} in query"
@@ -256,34 +279,13 @@ defmodule Ector.Query do
         Ector.Query.__join_source_module__(unquote(query_var), unquote(source_alias))
 
       unquote(association_var) =
-        Enum.find(
-          unquote(source_module_var).__ector_associations__(),
-          &(&1.name == unquote(association_name))
-        ) ||
-          raise ArgumentError,
-                "unknown Ector association #{inspect(unquote(association_name))} for #{inspect(unquote(source_module_var))}"
+        Ector.Query.__association__!(
+          unquote(source_module_var),
+          unquote(association_name)
+        )
 
       unquote(edge_label_var) =
-        case unquote(association_var) do
-          %{opts: %{through: through}} ->
-            cond do
-              is_atom(through) and Code.ensure_loaded?(through) and
-                  function_exported?(through, :__ector_label__, 0) ->
-                through.__ector_label__()
-
-              is_atom(through) ->
-                through |> Atom.to_string() |> String.upcase()
-
-              is_binary(through) ->
-                through |> Macro.underscore() |> String.upcase()
-
-              true ->
-                raise ArgumentError, "unsupported Ector edge label source: #{inspect(through)}"
-            end
-
-          %{name: name} when is_atom(name) ->
-            name |> Atom.to_string() |> String.upcase()
-        end
+        Ector.Query.__edge_label__(unquote(association_var))
 
       unquote(target_label_var) = unquote(association_var).target.__ector_label__()
 
@@ -331,14 +333,179 @@ defmodule Ector.Query do
     end
   end
 
+  @doc false
+  @spec __association__!(module(), atom()) :: map()
+  def __association__!(module, association_name)
+      when is_atom(module) and is_atom(association_name) do
+    Enum.find(module_associations(module), &(&1.name == association_name)) ||
+      raise ArgumentError,
+            "unknown Ector association #{inspect(association_name)} for #{inspect(module)}"
+  end
+
+  @doc false
+  @spec __edge_label__(map()) :: String.t()
+  def __edge_label__(association) when is_map(association), do: edge_label_for(association)
+
+  @doc false
+  @spec __ector_schema_module__(module()) :: boolean()
+  def __ector_schema_module__(module) when is_atom(module), do: ector_schema_module?(module)
+
+  defp module_associations(module) when is_atom(module) do
+    module
+    |> schema_associations()
+    |> Kernel.++(ector_associations(module))
+    |> merge_duplicate_associations()
+  end
+
+  defp schema_associations(module) when is_atom(module) do
+    if function_exported?(module, :__schema__, 1) do
+      module
+      |> apply(:__schema__, [:associations])
+      |> Enum.map(&schema_association(module, &1))
+      |> Enum.reject(&is_nil/1)
+    else
+      []
+    end
+  end
+
+  defp schema_association(module, association_name) do
+    if function_exported?(module, :__schema__, 1) do
+      module
+      |> apply(:__schema__, [:association, association_name])
+      |> normalize_schema_association()
+    else
+      nil
+    end
+  end
+
+  defp normalize_schema_association(%Ecto.Association.BelongsTo{} = association) do
+    %{
+      cardinality: :one,
+      direction: :incoming,
+      name: association.field,
+      opts: schema_association_opts(association),
+      owner: association.owner,
+      owner_key: association.owner_key,
+      target: association.related
+    }
+  end
+
+  defp normalize_schema_association(%Ecto.Association.Has{} = association) do
+    %{
+      cardinality: association.cardinality,
+      direction: :outgoing,
+      name: association.field,
+      opts: schema_association_opts(association),
+      owner: association.owner,
+      owner_key: association.owner_key,
+      target: association.related
+    }
+  end
+
+  defp normalize_schema_association(_association), do: nil
+
+  defp schema_association_opts(association) do
+    association
+    |> Map.from_struct()
+    |> Map.take([:through, :foreign_key])
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp ector_associations(module) when is_atom(module) do
+    if function_exported?(module, :__ector_associations__, 0) do
+      module.__ector_associations__()
+    else
+      []
+    end
+  end
+
+  defp merge_duplicate_associations(associations) do
+    associations
+    |> Enum.group_by(&association_identity/1)
+    |> Enum.map(fn {_identity, duplicate_associations} ->
+      Enum.reduce(duplicate_associations, %{}, fn association, acc ->
+        Map.merge(acc, association, fn
+          :opts, left, right -> Map.merge(left, right)
+          _key, _left, right -> right
+        end)
+      end)
+    end)
+  end
+
+  defp association_identity(%{
+         cardinality: cardinality,
+         direction: direction,
+         name: name,
+         owner: owner,
+         target: target
+       }) do
+    {cardinality, direction, name, owner, target}
+  end
+
+  defp edge_label_for(%{opts: %{through: through}}) do
+    edge_label_from_through(through)
+  end
+
+  defp edge_label_for(%{direction: :incoming} = association) do
+    case inverse_outgoing_association(association) do
+      nil -> named_edge_label(association.name)
+      inverse_association -> edge_label_for(inverse_association)
+    end
+  end
+
+  defp edge_label_for(%{name: name}) when is_atom(name), do: named_edge_label(name)
+
+  defp edge_label_from_through(through) do
+    cond do
+      edge_schema_module?(through) ->
+        through.__ector_label__()
+
+      is_atom(through) ->
+        through |> Atom.to_string() |> String.upcase()
+
+      is_binary(through) ->
+        through |> Macro.underscore() |> String.upcase()
+
+      true ->
+        raise ArgumentError, "unsupported Ector edge label source: #{inspect(through)}"
+    end
+  end
+
+  defp inverse_outgoing_association(%{owner: owner, target: target})
+       when is_atom(owner) and is_atom(target) do
+    target
+    |> module_associations()
+    |> Enum.filter(&(&1.direction == :outgoing and &1.target == owner))
+    |> case do
+      [association] -> association
+      _ambiguous_or_missing -> nil
+    end
+  end
+
+  defp named_edge_label(name) when is_atom(name) do
+    name |> Atom.to_string() |> String.upcase()
+  end
+
+  defp edge_schema_module?(module) when is_atom(module) do
+    Code.ensure_loaded?(module) and function_exported?(module, :__ector_kind__, 0) and
+      function_exported?(module, :__ector_label__, 0) and module.__ector_kind__() == :edge
+  end
+
+  defp edge_schema_module?(_module), do: false
+
   defp rewrite_from_source({:in, meta, [binding, source]}, caller) do
     case Macro.expand(source, caller) do
       module when is_atom(module) ->
-        if ector_schema_module?(module) do
-          source_tuple = Macro.escape(storage_source_tuple(module))
-          {:ok, {:in, meta, [binding, source_tuple]}, label_binding(binding), module}
-        else
-          :error
+        cond do
+          ector_schema_module?(module) ->
+            source_tuple = Macro.escape(storage_source_tuple(module))
+            {:ok, {:in, meta, [binding, source_tuple]}, label_binding(binding), module}
+
+          Code.ensure_loaded?(module) ->
+            :error
+
+          true ->
+            {:defer, {:in, meta, [binding, nil]}, label_binding(binding), module}
         end
 
       _other ->
@@ -349,12 +516,18 @@ defmodule Ector.Query do
   defp rewrite_from_source(source, caller) do
     case Macro.expand(source, caller) do
       module when is_atom(module) ->
-        if ector_schema_module?(module) do
-          binding = Macro.unique_var(:ector_source, __MODULE__)
-          source_tuple = Macro.escape(storage_source_tuple(module))
-          {:ok, {:in, [], [binding, source_tuple]}, binding, module}
-        else
-          :error
+        cond do
+          ector_schema_module?(module) ->
+            binding = Macro.unique_var(:ector_source, __MODULE__)
+            source_tuple = Macro.escape(storage_source_tuple(module))
+            {:ok, {:in, [], [binding, source_tuple]}, binding, module}
+
+          Code.ensure_loaded?(module) ->
+            :error
+
+          true ->
+            binding = Macro.unique_var(:ector_source, __MODULE__)
+            {:defer, {:in, [], [binding, nil]}, binding, module}
         end
 
       _other ->
@@ -365,9 +538,19 @@ defmodule Ector.Query do
   defp label_binding([binding | _rest]), do: binding
   defp label_binding(binding), do: binding
 
+  defp put_deferred_source({:in, meta, [binding, nil]}, source_var) do
+    {:in, meta, [binding, source_var]}
+  end
+
   defp label_filter_ast(binding, label_var) do
     {:==, [], [field_call_ast(binding, :label), {:^, [], [label_var]}]}
   end
+
+  defp opts_with_label_filter([{:as, _alias_name} = as_option | rest], label_filter) do
+    [as_option, {:where, label_filter} | rest]
+  end
+
+  defp opts_with_label_filter(opts, label_filter), do: [{:where, label_filter} | opts]
 
   defp field_call_ast(binding, field) do
     {:field, [], [binding, field]}
@@ -402,6 +585,7 @@ defmodule Ector.Query do
     end
   end
 
+  defp join_source(%Ecto.Query{from: nil}, nil), do: :error
   defp join_source(%Ecto.Query{from: %{source: source}}, nil), do: {:ok, source}
 
   defp join_source(%Ecto.Query{} = query, source_alias) when is_atom(source_alias) do

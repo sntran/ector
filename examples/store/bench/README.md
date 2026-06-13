@@ -9,13 +9,12 @@ storage topology used by the LiveView app: all domain attributes live in
 The benchmark runs three scenarios:
 
 * **Batch seed nodes and edges** inserts synthetic Product, Offer, Cart, and
-  CartItem nodes plus Product -> Offer, Cart -> CartItem, and Offer -> CartItem
-  edges.
+  CartItem nodes plus the implicit Product -> Offer, Cart -> CartItem, and
+  Offer -> CartItem relationships.
 * **Single-cursor catalog search** runs the catalog search path over
   denormalized Offer text using a real `?cursor=token` envelope for the second
   page.
-* **4-hop preload cart summary** runs the checkout read path with
-  `Repo.preload(items: [offer: :product])`, resolving
+* **Implicit CartItem cart summary** runs the checkout read path through
   `Cart -> CartItem -> Offer -> Product`.
 
 ## Baseline
@@ -43,10 +42,10 @@ STORE_ADAPTER=postgres STORE_DATABASE_URL=postgres://user:pass@localhost/store_e
 
 ## Latest Local Run
 
-Measured locally on 2026-06-12 with:
+Measured locally on 2026-06-13 with:
 
 ```bash
-MIX_DEPS_PATH=../../deps BENCH_N=1000 BENCH_WARMUP=0.25 BENCH_TIME=1 BENCH_MEMORY_TIME=1 mix run bench/store_bench.exs
+BENCH_N=1000 BENCH_WARMUP=0.25 BENCH_TIME=1 BENCH_MEMORY_TIME=1 mix run bench/store_bench.exs
 ```
 
 Environment:
@@ -66,22 +65,22 @@ Throughput and latency:
 
 | Scenario | ips | Average | Median | 99th % |
 |----------|----:|--------:|-------:|-------:|
-| 4-hop preload cart summary | 669.66 | 1.49 ms | 1.53 ms | 1.79 ms |
-| Single-cursor catalog search | 172.91 | 5.78 ms | 5.78 ms | 7.69 ms |
-| Batch seed nodes and edges | 10.99 | 90.98 ms | 111.72 ms | 124.78 ms |
+| Implicit CartItem cart summary | 392.31 | 2.55 ms | 2.29 ms | 5.23 ms |
+| Single-cursor catalog search | 120.33 | 8.31 ms | 7.20 ms | 15.33 ms |
+| Batch seed nodes and edges | 6.95 | 143.79 ms | 171.70 ms | 202.96 ms |
 
 Memory:
 
 | Scenario | Average | Median | 99th % |
 |----------|--------:|-------:|-------:|
-| 4-hop preload cart summary | 130.87 KB | 130.87 KB | 130.87 KB |
-| Single-cursor catalog search | 127.25 KB | 127.25 KB | 127.25 KB |
-| Batch seed nodes and edges | 15117.50 KB | 15116.43 KB | 15127.34 KB |
+| Implicit CartItem cart summary | 160.27 KB | 160.27 KB | 160.27 KB |
+| Single-cursor catalog search | 127.38 KB | 127.38 KB | 127.38 KB |
+| Batch seed nodes and edges | 15111.97 KB | 15112.09 KB | 15112.41 KB |
 
-The read paths are the enterprise-relevant signal: the nested 4-hop preload
-cart summary completes in about 1.5 ms with roughly 131 KB allocated per
-operation, while cursor catalog search completes in about 5.8 ms with roughly
-127 KB allocated per operation on this local SQLite run.
+The read paths are the enterprise-relevant signal: the implicit CartItem cart
+summary completes in about 2.6 ms with roughly 160 KB allocated per operation,
+while cursor catalog search completes in about 8.3 ms with roughly 127 KB
+allocated per operation on this local SQLite run.
 
 ## Reading The Numbers
 

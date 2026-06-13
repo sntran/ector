@@ -32,6 +32,8 @@ the unreleased history on this branch from the initial bootstrap on
   shapes.
 - Added graph-aware `Repo.preload` support for Ector schemas, including
   `belongs_to`, `has_many`, `has_one`, and nested preload traversal.
+- Added implicit edge routing for property-less associations, including reverse
+  `belongs_to` fallback through the parent-side edge label.
 
 ### Changed
 
@@ -44,6 +46,8 @@ the unreleased history on this branch from the initial bootstrap on
   `?cursor=token` envelope instead of split directional params.
 - Refactored store hydration to prefer `Repo.preload` for display reads while
   keeping the denormalized Offer boundary and database-side stock decrements.
+- Removed property-less symbolic `through:` labels from the store example so it
+  exercises implicit edge routing.
 - Consolidated preload coverage into `test/ector/repo_test.exs` so repo
   boundary behavior, JSON update translation, and graph preload execution are
   verified together.

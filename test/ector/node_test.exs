@@ -44,6 +44,20 @@ defmodule Ector.NodeTest do
     end
   end
 
+  defmodule CustomChangesetUser do
+    use Ector.Node
+
+    schema do
+      field(:name, :string)
+    end
+
+    def changeset(struct, attrs) do
+      struct
+      |> Ecto.Changeset.cast(attrs, [:name])
+      |> Ecto.Changeset.validate_required([:name])
+    end
+  end
+
   test "injects the default business id and hidden routing id" do
     assert :id in Catalog.User.__schema__(:fields)
     assert :__id__ in Catalog.User.__schema__(:fields)
@@ -56,6 +70,18 @@ defmodule Ector.NodeTest do
     assert :external_id in Billing.User.__schema__(:fields)
     refute :id in Billing.User.__schema__(:fields)
     assert :__id__ in Billing.User.__schema__(:fields)
+  end
+
+  test "belongs_to uses native Ecto foreign key generation with UUID storage ids" do
+    assert :account_id in Billing.User.__schema__(:fields)
+    assert Billing.User.__schema__(:type, :account_id) == Ecto.UUID
+    assert Map.has_key?(%Billing.User{}, :account_id)
+
+    assert %Ecto.Association.BelongsTo{
+             field: :account,
+             owner_key: :account_id,
+             related: Account
+           } = Billing.User.__schema__(:association, :account)
   end
 
   test "compiles outgoing and incoming association metadata" do
@@ -106,6 +132,13 @@ defmodule Ector.NodeTest do
     assert Ecto.Changeset.get_field(keyword_changeset, :name) == "Ada"
     refute Map.has_key?(keyword_changeset.changes, :__id__)
     assert Ecto.Changeset.get_field(invalid_changeset, :__id__) == existing_id
+  end
+
+  test "does not inject the default changeset when a schema defines its own" do
+    changeset = CustomChangesetUser.changeset(%CustomChangesetUser{}, %{})
+
+    refute changeset.valid?
+    assert {"can't be blank", _opts} = changeset.errors[:name]
   end
 
   test "runtime node macro application produces the expected schema helpers" do

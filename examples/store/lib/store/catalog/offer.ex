@@ -32,8 +32,8 @@ defmodule Store.Catalog.Offer do
     field(:product_name, :string)
     field(:product_description, :string)
 
-    belongs_to(:product, Product, through: :product_offers)
-    has_many(:cart_items, CartItem, through: :cart_item_offers)
+    belongs_to(:product, Product, define_field: false)
+    has_many(:cart_items, CartItem)
   end
 
   @type t :: %__MODULE__{

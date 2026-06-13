@@ -5,6 +5,19 @@ defmodule Ector.Schema do
   @type association_cardinality :: :one | :many
   @type association_kind :: :node | :edge
 
+  @ecto_belongs_to_options [
+    :foreign_key,
+    :references,
+    :define_field,
+    :type,
+    :on_replace,
+    :defaults,
+    :primary_key,
+    :source,
+    :where
+  ]
+
+  @doc false
   @spec label_for(module(), association_kind()) :: String.t()
   def label_for(module, :node) when is_atom(module) do
     module
@@ -43,9 +56,21 @@ defmodule Ector.Schema do
       use Ecto.Schema
       require Ector.Schema
 
+      import Ecto.Schema,
+        except: [
+          schema: 2,
+          has_many: 2,
+          has_many: 3,
+          has_one: 2,
+          has_one: 3,
+          belongs_to: 2,
+          belongs_to: 3
+        ]
+
       import Ector.Schema,
         only: [
           schema: 1,
+          schema: 2,
           has_many: 2,
           has_many: 3,
           has_one: 2,
@@ -59,6 +84,7 @@ defmodule Ector.Schema do
       # Ector keeps storage identity separate from the caller's domain identity,
       # so we disable Ecto's implicit primary key before the schema body runs.
       @primary_key false
+      @foreign_key_type Ecto.UUID
 
       Module.register_attribute(__MODULE__, :ector_associations, accumulate: true)
     end
@@ -149,6 +175,7 @@ defmodule Ector.Schema do
           %{unquote_splicing(Macro.escape(@ecto_changeset_fields))}
         end
 
+        @doc false
         def __schema__(:source), do: nil
         def __schema__(:prefix), do: unquote(Macro.escape(prefix))
 
@@ -162,6 +189,14 @@ defmodule Ector.Schema do
     quote do
       unquote(prelude)
       unquote(postlude)
+    end
+  end
+
+  defmacro schema(_source, do: block) do
+    quote do
+      Ector.Schema.schema do
+        unquote(block)
+      end
     end
   end
 
@@ -188,10 +223,18 @@ defmodule Ector.Schema do
   defmacro belongs_to(name, target, opts \\ []) do
     target = Macro.expand(target, __CALLER__)
     opts = expand_association_opts(opts, __CALLER__)
+    ecto_opts = ecto_belongs_to_opts(opts)
     association = association_metadata(__CALLER__.module, :belongs_to, name, target, opts)
 
-    quote bind_quoted: [association: Macro.escape(association)] do
-      @ector_associations association
+    quote do
+      Ecto.Schema.__belongs_to__(
+        __MODULE__,
+        unquote(name),
+        unquote(Macro.escape(target)),
+        unquote(Macro.escape(ecto_opts))
+      )
+
+      @ector_associations unquote(Macro.escape(association))
     end
   end
 
@@ -207,6 +250,10 @@ defmodule Ector.Schema do
       {:through, through} -> {:through, Macro.expand(through, caller)}
       option -> option
     end)
+  end
+
+  defp ecto_belongs_to_opts(opts) do
+    Keyword.take(opts, @ecto_belongs_to_options)
   end
 
   defp rewrite_association_calls(block) do

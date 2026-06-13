@@ -48,6 +48,8 @@ defmodule StoreIntegrationTest do
 
     assert CartItem.changeset(%CartItem{}, %{
              id: "item-1",
+             cart_id: Ecto.UUID.generate(version: 7),
+             offer_id: Ecto.UUID.generate(version: 7),
              quantity: 2,
              price_at_addition: 12_500
            }).valid?
@@ -144,7 +146,7 @@ defmodule StoreIntegrationTest do
     assert Enum.map(vendor_page.entries, & &1.id) == ["offer-2"]
   end
 
-  test "get_cart_summary preloads Cart -> CartItem -> Offer -> Product" do
+  test "get_cart_summary reads Cart -> CartItem -> Offer -> Product" do
     seed_storefront_fixture!()
 
     assert %{
@@ -218,7 +220,7 @@ defmodule StoreIntegrationTest do
   defp seed_storefront_fixture! do
     product_offer_label = Storage.edge_label!(Product, :offers)
     cart_item_label = Storage.edge_label!(Cart, :items)
-    offer_item_label = Storage.edge_label!(Offer, :cart_items)
+    offer_cart_item_label = Storage.edge_label!(Offer, :cart_items)
 
     products = [
       product_fixture(
@@ -262,25 +264,25 @@ defmodule StoreIntegrationTest do
     }
 
     items = [
-      cart_item_fixture("item-1", 2, 12_500, Enum.at(offers, 0)),
-      cart_item_fixture("item-2", 1, 13_100, Enum.at(offers, 1)),
-      cart_item_fixture("item-3", 3, 2_500, Enum.at(offers, 3))
+      cart_item_fixture("item-1", 2, 12_500, cart.storage_id, Enum.at(offers, 0)),
+      cart_item_fixture("item-2", 1, 13_100, cart.storage_id, Enum.at(offers, 1)),
+      cart_item_fixture("item-3", 3, 2_500, cart.storage_id, Enum.at(offers, 3))
     ]
 
     Storage.insert_nodes!(
       Enum.map(products, & &1.row) ++
-        Enum.map(offers, & &1.row) ++ [cart.row | Enum.map(items, & &1.row)]
+        Enum.map(offers, & &1.row) ++ [cart.row] ++ Enum.map(items, & &1.row)
     )
 
     Storage.insert_edges!(
       Enum.map(offers, fn offer ->
         Storage.edge_row(product_offer_label, offer.product_storage_id, offer.storage_id)
       end) ++
-        Enum.flat_map(items, fn item ->
-          [
-            Storage.edge_row(cart_item_label, cart.storage_id, item.storage_id),
-            Storage.edge_row(offer_item_label, item.offer_storage_id, item.storage_id)
-          ]
+        Enum.map(items, fn item ->
+          Storage.edge_row(cart_item_label, item.cart_storage_id, item.storage_id)
+        end) ++
+        Enum.map(items, fn item ->
+          Storage.edge_row(offer_cart_item_label, item.offer_storage_id, item.storage_id)
         end)
     )
   end
@@ -321,18 +323,22 @@ defmodule StoreIntegrationTest do
     }
   end
 
-  defp cart_item_fixture(id, quantity, price_at_addition, offer) do
+  defp cart_item_fixture(id, quantity, price_at_addition, cart_storage_id, offer) do
     storage_id = Storage.uuidv7()
+
+    properties = %{
+      id: id,
+      cart_id: cart_storage_id,
+      offer_id: offer.storage_id,
+      quantity: quantity,
+      price_at_addition: price_at_addition
+    }
 
     %{
       storage_id: storage_id,
+      cart_storage_id: cart_storage_id,
       offer_storage_id: offer.storage_id,
-      row:
-        Storage.node_row(
-          CartItem,
-          %{id: id, quantity: quantity, price_at_addition: price_at_addition},
-          storage_id
-        )
+      row: Storage.node_row(CartItem, properties, storage_id)
     }
   end
 

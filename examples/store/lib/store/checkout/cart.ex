@@ -12,7 +12,7 @@ defmodule Store.Checkout.Cart do
   schema do
     field(:status, :string, default: "active")
 
-    has_many(:items, CartItem, through: :cart_items)
+    has_many(:items, CartItem)
   end
 
   @type t :: %__MODULE__{

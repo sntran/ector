@@ -241,7 +241,6 @@ defmodule Ector.Repo do
       when is_atom(repo) and is_atom(module) and is_list(opts) do
     case preload(repo, [struct], preloads, opts) do
       [loaded] -> loaded
-      [] -> struct
     end
   end
 
@@ -378,14 +377,19 @@ defmodule Ector.Repo do
       if parent_ids == [] do
         []
       else
-        fetch_edge_targets(
-          repo,
-          association,
-          parent_ids,
-          parent_edge_key,
-          target_edge_key,
-          opts
+        repo
+        |> fetch_outgoing_foreign_key_targets(association, parent_ids, opts)
+        |> Kernel.++(
+          fetch_edge_targets(
+            repo,
+            association,
+            parent_ids,
+            parent_edge_key,
+            target_edge_key,
+            opts
+          )
         )
+        |> Enum.uniq_by(fn {parent_id, target} -> {parent_id, parent_hidden_id(target)} end)
       end
       |> preload_pair_targets(repo, nested_preloads, opts)
 
@@ -477,6 +481,46 @@ defmodule Ector.Repo do
     end)
   end
 
+  defp fetch_outgoing_foreign_key_targets(repo, association, parent_ids, opts) do
+    case inverse_incoming_association(association) do
+      nil ->
+        []
+
+      %{opts: association_opts} = inverse_association ->
+        if Map.has_key?(association_opts, :through) do
+          []
+        else
+          fetch_outgoing_foreign_key_targets(
+            repo,
+            association,
+            inverse_association,
+            parent_ids,
+            opts
+          )
+        end
+    end
+  end
+
+  defp fetch_outgoing_foreign_key_targets(
+         repo,
+         association,
+         inverse_association,
+         parent_ids,
+         opts
+       ) do
+    foreign_key = association_foreign_key(inverse_association)
+
+    from(node in Ector.Node,
+      where:
+        node.label == ^association.target.__ector_label__() and
+          node.properties[^Atom.to_string(foreign_key)] in ^parent_ids,
+      select: node
+    )
+    |> repo.all(storage_opts(opts))
+    |> Enum.map(&hydrate(association.target, &1))
+    |> Enum.map(fn target -> {Map.fetch!(target, foreign_key), target} end)
+  end
+
   defp preload_pair_targets([], _repo, _nested_preloads, _opts), do: []
 
   defp preload_pair_targets(loaded_pairs, repo, nested_preloads, opts) do
@@ -533,15 +577,6 @@ defmodule Ector.Repo do
 
   defp association_foreign_key(%{owner_key: owner_key}) when is_atom(owner_key), do: owner_key
 
-  defp association_foreign_key(%{opts: %{foreign_key: foreign_key}})
-       when is_atom(foreign_key) do
-    foreign_key
-  end
-
-  defp association_foreign_key(%{name: name}) when is_atom(name) do
-    :"#{name}_id"
-  end
-
   defp hidden_ids(structs) do
     structs
     |> Enum.map(&parent_hidden_id/1)
@@ -555,13 +590,29 @@ defmodule Ector.Repo do
   defp valid_hidden_id?(_value), do: false
 
   defp parent_hidden_id(%{__id__: hidden_id}), do: hidden_id
-  defp parent_hidden_id(_struct), do: nil
 
   defp association!(module, association_name) do
-    schema_association(module, association_name) ||
-      ector_association(module, association_name) ||
+    Enum.find(module_associations(module), &(&1.name == association_name)) ||
       raise ArgumentError,
             "unknown Ector association #{inspect(association_name)} for #{inspect(module)}"
+  end
+
+  defp module_associations(module) when is_atom(module) do
+    module
+    |> schema_associations()
+    |> Kernel.++(ector_associations(module))
+    |> merge_duplicate_associations()
+  end
+
+  defp schema_associations(module) when is_atom(module) do
+    if function_exported?(module, :__schema__, 1) do
+      module
+      |> apply(:__schema__, [:associations])
+      |> Enum.map(&schema_association(module, &1))
+      |> Enum.reject(&is_nil/1)
+    else
+      []
+    end
   end
 
   defp schema_association(module, association_name) do
@@ -572,18 +623,14 @@ defmodule Ector.Repo do
     else
       nil
     end
-  rescue
-    FunctionClauseError -> nil
   end
-
-  defp normalize_schema_association(nil), do: nil
 
   defp normalize_schema_association(%Ecto.Association.BelongsTo{} = association) do
     %{
       cardinality: :one,
       direction: :incoming,
       name: association.field,
-      opts: %{},
+      opts: schema_association_opts(association),
       owner: association.owner,
       owner_key: association.owner_key,
       target: association.related
@@ -595,7 +642,7 @@ defmodule Ector.Repo do
       cardinality: association.cardinality,
       direction: :outgoing,
       name: association.field,
-      opts: %{},
+      opts: schema_association_opts(association),
       owner: association.owner,
       owner_key: association.owner_key,
       target: association.related
@@ -604,11 +651,42 @@ defmodule Ector.Repo do
 
   defp normalize_schema_association(_association), do: nil
 
-  defp ector_association(module, association_name) do
+  defp schema_association_opts(association) do
+    association
+    |> Map.from_struct()
+    |> Map.take([:through, :foreign_key])
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp ector_associations(module) when is_atom(module) do
     if function_exported?(module, :__ector_associations__, 0) do
       module.__ector_associations__()
-      |> Enum.find(&(&1.name == association_name))
+    else
+      []
     end
+  end
+
+  defp merge_duplicate_associations(associations) do
+    associations
+    |> Enum.group_by(&association_identity/1)
+    |> Enum.map(fn {_identity, duplicate_associations} ->
+      Enum.reduce(duplicate_associations, %{}, fn association, acc ->
+        Map.merge(acc, association, fn
+          :opts, left, right -> Map.merge(left, right)
+          _key, _left, right -> right
+        end)
+      end)
+    end)
+  end
+
+  defp association_identity(%{
+         cardinality: cardinality,
+         direction: direction,
+         name: name,
+         owner: owner,
+         target: target
+       }) do
+    {cardinality, direction, name, owner, target}
   end
 
   @spec storage_select_query(term()) ::
@@ -808,9 +886,13 @@ defmodule Ector.Repo do
   end
 
   @spec domain_set_updates(Changeset.t()) :: keyword()
-  defp domain_set_updates(%Changeset{changes: changes}) do
+  defp domain_set_updates(%Changeset{data: %{__struct__: module}, changes: changes})
+       when is_atom(module) do
+    property_fields = module |> property_fields() |> MapSet.new()
+
     changes
-    |> Map.drop([:__id__, :__ector_edges__])
+    |> Map.delete(:__ector_edges__)
+    |> Enum.filter(fn {field_name, _value} -> MapSet.member?(property_fields, field_name) end)
     |> Enum.map(fn {field_name, value} -> {field_name, normalize_json(value)} end)
   end
 
@@ -923,9 +1005,21 @@ defmodule Ector.Repo do
   end
 
   defp edge_label_for(%{opts: %{through: through}}) do
+    edge_label_from_through(through)
+  end
+
+  defp edge_label_for(%{direction: :incoming} = association) do
+    case inverse_outgoing_association(association) do
+      nil -> named_edge_label(association.name)
+      inverse_association -> edge_label_for(inverse_association)
+    end
+  end
+
+  defp edge_label_for(%{name: name}) when is_atom(name), do: named_edge_label(name)
+
+  defp edge_label_from_through(through) do
     cond do
-      is_atom(through) and Code.ensure_loaded?(through) and
-          function_exported?(through, :__ector_label__, 0) ->
+      edge_schema_module?(through) ->
         through.__ector_label__()
 
       is_atom(through) ->
@@ -939,16 +1033,50 @@ defmodule Ector.Repo do
     end
   end
 
-  defp edge_label_for(%{name: name}) when is_atom(name) do
+  defp inverse_outgoing_association(%{owner: owner, target: target})
+       when is_atom(owner) and is_atom(target) do
+    target
+    |> module_associations()
+    |> Enum.filter(&(&1.direction == :outgoing and &1.target == owner))
+    |> case do
+      [association] -> association
+      _ambiguous_or_missing -> nil
+    end
+  end
+
+  defp inverse_incoming_association(%{owner: owner, target: target})
+       when is_atom(owner) and is_atom(target) do
+    target
+    |> module_associations()
+    |> Enum.filter(&(&1.direction == :incoming and &1.target == owner))
+    |> case do
+      [association] -> association
+      _ambiguous_or_missing -> nil
+    end
+  end
+
+  defp named_edge_label(name) when is_atom(name) do
     name |> Atom.to_string() |> String.upcase()
   end
 
+  defp edge_schema_module?(module) when is_atom(module) do
+    Code.ensure_loaded?(module) and function_exported?(module, :__ector_kind__, 0) and
+      function_exported?(module, :__ector_label__, 0) and module.__ector_kind__() == :edge
+  end
+
+  defp edge_schema_module?(_module), do: false
+
   defp properties_from_changeset(%Changeset{} = changeset) do
+    module = changeset.data.__struct__
+
     changeset
     |> Changeset.apply_changes()
-    |> Map.from_struct()
-    |> Map.drop([:__id__])
+    |> Map.take(property_fields(module))
     |> normalize_json()
+  end
+
+  defp property_fields(module) when is_atom(module) do
+    module.__schema__(:fields) -- [:__id__]
   end
 
   defp extract_property_updates(updates) when is_list(updates) do
