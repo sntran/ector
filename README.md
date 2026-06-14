@@ -84,6 +84,8 @@ PostgreSQL receives nested `jsonb_set` / `jsonb_build_array` expressions. SQLite
 
 -   **Deterministic Edge Aliasing:** When you call `Ector.join(:carts, as: :cart)`, Ector injects a hidden join for the intermediate `edges` table, and applies your `:cart` alias directly to the target node. This keeps your bindings clean and predictable.
 
+-   **Codebase Conversion:** `mix ector.migrate` scans `lib/**/*.ex`, rewrites direct `use Ecto.Schema` calls to `use Ector.Node` without generating edge modules, and prints each modified path. `--dry-run` reports paths without writing. `--data --repo MyApp.Repo` also streams legacy rows into `nodes` and stitches foreign keys into implicit `edges`.
+
 Contributing
 ------------
 

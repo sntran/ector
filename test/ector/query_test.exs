@@ -43,6 +43,17 @@ defmodule Ector.QueryTest do
 
     schema "plain_schemas" do
       field(:status, :string)
+
+      has_many(:posts, Ector.QueryTest.PlainPost, foreign_key: :plain_schema_id)
+    end
+  end
+
+  defmodule PlainPost do
+    use Ecto.Schema
+
+    schema "plain_posts" do
+      field(:title, :string)
+      field(:plain_schema_id, :id)
     end
   end
 
@@ -247,17 +258,56 @@ defmodule Ector.QueryTest do
     plain_query = Ector.Query.from(plain in PlainSchema, where: plain.status == "active")
 
     assert plain_query.from.source == {"plain_schemas", PlainSchema}
-    assert json_path_access?(hd(plain_query.wheres).expr, "status")
+    assert physical_field_access?(hd(plain_query.wheres).expr, :status)
+
+    plain_where_query =
+      PlainSchema
+      |> Ecto.Query.from()
+      |> Ector.Query.where([plain], plain.status == "active")
+
+    assert physical_field_access?(hd(plain_where_query.wheres).expr, :status)
 
     string_source_query = Ector.Query.from(row in "plain_schemas", where: row.status == "active")
 
     assert string_source_query.from.source == {"plain_schemas", nil}
-    assert json_path_access?(hd(string_source_query.wheres).expr, "status")
+    assert physical_field_access?(hd(string_source_query.wheres).expr, :status)
 
     bare_string_query = Ector.Query.from("plain_schemas")
 
     assert bare_string_query.from.source == {"plain_schemas", nil}
     assert bare_string_query.wheres == []
+  end
+
+  test "from/1 delegates completely plain modules to Ecto's invalid module fallback" do
+    assert_raise UndefinedFunctionError, ~r/String.__schema__\/1 is undefined/, fn ->
+      Code.eval_quoted(
+        quote do
+          require Ector.Query
+          Ector.Query.from(String)
+        end,
+        [],
+        __ENV__
+      )
+    end
+  end
+
+  test "from/2 rewrites Ector query options and preserves standard options" do
+    query =
+      Ector.Query.from(u in User,
+        as: :user,
+        where: u.status == "active",
+        select: u.email,
+        order_by: [asc: u.status]
+      )
+
+    assert query.from.source == {"nodes", User}
+    assert query.aliases == %{user: 0}
+
+    assert [label_filter, status_filter] = query.wheres
+    assert physical_field_access?(label_filter.expr, :label)
+    assert json_path_access?(status_filter.expr, "status")
+    assert json_path_access?(query.select.expr, "email")
+    assert json_path_access?(hd(query.order_bys).expr, "status")
   end
 
   test "from/1 defers Ector schema detection for forward module references" do
@@ -635,21 +685,36 @@ defmodule Ector.QueryTest do
       Ector.Query.join(query, :unknown, as: :cart)
     end
 
-    assert_raise ArgumentError, ~r/expected an Ector schema module/, fn ->
+    standard_join =
       PlainSchema
       |> Ecto.Query.from()
-      |> Ector.Query.join(:carts, as: :cart)
-    end
+      |> Ector.Query.join(:posts, as: :post)
 
-    assert_raise ArgumentError, ~r/expected an Ector query source/, fn ->
+    assert [%Ecto.Query.JoinExpr{assoc: {0, :posts}, as: :post, source: nil}] =
+             standard_join.joins
+
+    assert_raise ArgumentError, ~r/expected an Ecto or Ector query source/, fn ->
       Ector.Query.join(%Ecto.Query{from: %Ecto.Query.FromExpr{source: "plain"}}, :carts,
         as: :cart
       )
     end
 
-    assert_raise ArgumentError, ~r/expected an Ector query source, got: nil/, fn ->
+    assert_raise ArgumentError, ~r/expected an Ecto or Ector query source, got: nil/, fn ->
       Ector.Query.join(%Ecto.Query{}, :carts, as: :cart)
     end
+  end
+
+  test "join/3 rejects query sources backed by plain non-schema modules" do
+    query = %Ecto.Query{from: %Ecto.Query.FromExpr{source: {"plain", String}}}
+
+    assert_raise ArgumentError, ~r/expected an Ecto or Ector schema module, got: String/, fn ->
+      Ector.Query.join(query, :anything, as: :anything)
+    end
+  end
+
+  test "__ector_query__/1 returns false for non-queryable values" do
+    refute Ector.Query.__ector_query__(%{not: :queryable})
+    refute Ector.Query.__ector_query__(%Ecto.Query{})
   end
 
   test "join/3 resolves module atom binary named and invalid edge labels" do

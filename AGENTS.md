@@ -79,3 +79,4 @@ The storefront uses one URL-safe cursor parameter for both directions.
 * `lib/ector/repo.ex` — Unified execution wrapper (`all`, `insert`, `update`, `update_all`, `preload`).
 * `lib/ector/query.ex` — The AST rewriter (`from`, `where`, `join`, `select`).
 * `lib/ector/translator/*.ex` — Dialect-specific JSON update fragment generators.
+* `lib/mix/tasks/ector.migrate.ex` — Codebase mutator and optional relational-data backfill task.

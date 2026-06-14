@@ -33,6 +33,18 @@ defmodule Ector.Schema do
     |> String.upcase()
   end
 
+  @doc """
+  Returns true when `module_or_struct` is an Ector schema module or struct.
+  """
+  @spec ector_schema?(module() | struct() | term()) :: boolean()
+  def ector_schema?(%module{}) when is_atom(module), do: ector_schema?(module)
+
+  def ector_schema?(module) when is_atom(module) do
+    Code.ensure_loaded?(module) and function_exported?(module, :__ector_kind__, 0)
+  end
+
+  def ector_schema?(_other), do: false
+
   @spec association_metadata(module(), atom(), atom(), module(), keyword()) :: map()
   defp association_metadata(owner, association_type, name, target, opts)
        when is_atom(owner) and is_atom(association_type) and is_atom(name) and is_atom(target) and

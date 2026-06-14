@@ -133,6 +133,9 @@ from(c in MyApp.Cart)
 
 ## Next steps
 
+- Convert an existing Ecto codebase with `mix ector.migrate`. Use `--dry-run`
+  to inspect modified paths and `--data --repo MyApp.Repo` to stream legacy rows
+  into `nodes` and stitch foreign keys into implicit `edges`.
 - See [API Stability](STABILITY.md) for what's safe to depend on.
-- See the README for indexing patterns, multi-tenancy, and current limitations
-  (e.g. `preload/2` is not yet supported — use `Ector.join/3` + `select/3`).
+- See the README for indexing patterns, multi-tenancy, graph preloading, and
+  conversion details.

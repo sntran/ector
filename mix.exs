@@ -78,6 +78,9 @@ defmodule Ector.MixProject do
           Ector.Migration,
           Ector.Query
         ],
+        "Mix Tasks": [
+          Mix.Tasks.Ector.Migrate
+        ],
         "Internal (Storage Engine)": [
           Ector.Schema,
           Ector.Translator,

@@ -232,6 +232,31 @@ defmodule Ector.RepoTest do
     end
   end
 
+  defmodule LegacyUser do
+    use Ecto.Schema
+
+    @primary_key {:id, :string, []}
+    schema "legacy_users" do
+      field(:email, :string)
+
+      has_many(:posts, Ector.RepoTest.LegacyPost, foreign_key: :legacy_user_id)
+    end
+  end
+
+  defmodule LegacyPost do
+    use Ecto.Schema
+
+    @primary_key {:id, :string, []}
+    schema "legacy_posts" do
+      field(:title, :string)
+
+      belongs_to(:legacy_user, Ector.RepoTest.LegacyUser,
+        foreign_key: :legacy_user_id,
+        type: :string
+      )
+    end
+  end
+
   defmodule CoreStorageMigration do
     use Ector.Migration
     require Ector.Migration
@@ -243,9 +268,22 @@ defmodule Ector.RepoTest do
         add(:id, :string, primary_key: true)
         add(:name, :string, null: false)
       end
+
+      create table(:legacy_users, primary_key: false) do
+        add(:id, :string, primary_key: true)
+        add(:email, :string, null: false)
+      end
+
+      create table(:legacy_posts, primary_key: false) do
+        add(:id, :string, primary_key: true)
+        add(:title, :string, null: false)
+        add(:legacy_user_id, :string, null: false)
+      end
     end
 
     def down do
+      drop_if_exists(table(:legacy_posts))
+      drop_if_exists(table(:legacy_users))
       drop_if_exists(table(:plain_widgets))
       Ector.Migration.down()
     end
@@ -286,12 +324,16 @@ defmodule Ector.RepoTest do
   end
 
   setup do
+    Ector.TestRepo.query!("DROP TABLE IF EXISTS legacy_posts")
+    Ector.TestRepo.query!("DROP TABLE IF EXISTS legacy_users")
     Ector.TestRepo.query!("DROP TABLE IF EXISTS plain_widgets")
     Ector.TestRepo.drop_core_tables!()
     Ector.TestRepo.migrate!(@migration_version, CoreStorageMigration)
 
     on_exit(fn ->
       Ector.TestRepo.rollback!(@migration_version, CoreStorageMigration)
+      Ector.TestRepo.query!("DROP TABLE IF EXISTS legacy_posts")
+      Ector.TestRepo.query!("DROP TABLE IF EXISTS legacy_users")
       Ector.TestRepo.query!("DROP TABLE IF EXISTS plain_widgets")
       Ector.TestRepo.drop_core_tables!()
     end)
@@ -480,13 +522,6 @@ defmodule Ector.RepoTest do
 
     error =
       assert_raise ArgumentError, fn ->
-        Ector.Repo.preload(repo, %PlainWidget{}, :posts)
-      end
-
-    assert Exception.message(error) =~ "expected an Ector schema module"
-
-    error =
-      assert_raise ArgumentError, fn ->
         Ector.Repo.preload(repo, :not_a_struct, :posts)
       end
 
@@ -497,7 +532,24 @@ defmodule Ector.RepoTest do
         Ector.Repo.preload(repo, [%User{}, :not_a_struct], :posts)
       end
 
-    assert Exception.message(error) =~ "expected an Ector schema struct or nil in preload list"
+    assert Exception.message(error) =~
+             "expected all preload entries to be Ector schema structs, standard Ecto schema structs, or nil"
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Ector.Repo.preload(repo, [%PlainWidget{}, :not_a_struct], :posts)
+      end
+
+    assert Exception.message(error) =~
+             "expected all preload entries to be Ector schema structs, standard Ecto schema structs, or nil"
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Ector.Repo.preload(repo, [:not_a_struct], :posts)
+      end
+
+    assert Exception.message(error) =~
+             "expected all preload entries to be Ector schema structs, standard Ecto schema structs, or nil"
 
     error =
       assert_raise ArgumentError, fn ->
@@ -1048,6 +1100,47 @@ defmodule Ector.RepoTest do
     assert {1, nil} = repo.delete_all(from(widget in PlainWidget, where: widget.id == "widget-2"))
 
     assert [%PlainWidget{id: "widget-3", name: "Gamma"}] = repo.all(PlainWidget)
+  end
+
+  test "insert update all and preload delegate standard Ecto schemas to relational tables" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert Ector.Schema.ector_schema?(User)
+    refute Ector.Schema.ector_schema?(LegacyUser)
+
+    assert {:ok, %LegacyUser{id: "legacy-1", email: "ada@example.com"} = inserted} =
+             repo.insert(%LegacyUser{id: "legacy-1", email: "ada@example.com"})
+
+    assert Ector.TestRepo.query!("SELECT COUNT(*) FROM legacy_users").rows == [[1]]
+    assert Ector.TestRepo.query!("SELECT COUNT(*) FROM nodes").rows == [[0]]
+
+    assert {:ok, %LegacyUser{id: "legacy-1", email: "grace@example.com"} = updated} =
+             inserted
+             |> Ecto.Changeset.change(email: "grace@example.com")
+             |> repo.update()
+
+    assert {:ok, %LegacyUser{id: "legacy-2", email: "hopper@example.com"} = second} =
+             repo.insert(%LegacyUser{id: "legacy-2", email: "hopper@example.com"})
+
+    assert [%LegacyUser{id: "legacy-1", email: "grace@example.com"}] =
+             repo.all(from(user in LegacyUser, where: user.id == "legacy-1"))
+
+    assert {2, nil} =
+             repo.insert_all(LegacyPost, [
+               %{id: "legacy-post-1", title: "Welcome", legacy_user_id: updated.id},
+               %{id: "legacy-post-2", title: "Patterns", legacy_user_id: second.id}
+             ])
+
+    assert %LegacyUser{posts: [%LegacyPost{id: "legacy-post-1", title: "Welcome"}]} =
+             Ector.Repo.preload(repo, updated, :posts)
+
+    assert [
+             %LegacyUser{posts: [%LegacyPost{id: "legacy-post-1", title: "Welcome"}]},
+             nil,
+             %LegacyUser{posts: [%LegacyPost{id: "legacy-post-2", title: "Patterns"}]}
+           ] = Ector.Repo.preload(repo, [updated, nil, second], :posts)
+
+    assert Ector.TestRepo.query!("SELECT COUNT(*) FROM nodes").rows == [[0]]
   end
 
   test "direct update_all/4 supports standard Ecto operators for Ector properties" do

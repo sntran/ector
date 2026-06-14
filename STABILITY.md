@@ -17,6 +17,7 @@ only happen in a major release and are documented in the [CHANGELOG](CHANGELOG.m
 | `Ector.Repo` | The `use Ector.Repo` macro and the overridden `Ecto.Repo` callbacks (`all`, `one`, `insert`, `update`, `delete`, `delete_all`, `update_all`, `preload`). |
 | `Ector.Migration` | `use Ector.Migration`, `up/1`, `down/1`, and the smart `index/3`. |
 | `Ector.Query` | The query-building macros. |
+| `mix ector.migrate` | The schema conversion task, `--dry-run`, `--data`, `--repo`, and `--chunk-size` options. |
 
 ## Engine Status
 

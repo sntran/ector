@@ -234,13 +234,27 @@ defmodule Ector.Repo do
 
   def preload(repo, structs, preloads, opts)
       when is_atom(repo) and is_list(structs) and is_list(opts) do
-    preload_structs(repo, structs, normalize_preloads(preloads), opts)
+    cond do
+      ector_preloadable_list?(structs) ->
+        preload_structs(repo, structs, normalize_preloads(preloads), opts)
+
+      ecto_preloadable_list?(structs) ->
+        repo.preload(structs, preloads, opts)
+
+      true ->
+        raise ArgumentError,
+              "expected all preload entries to be Ector schema structs, standard Ecto schema structs, or nil, got: #{inspect(structs)}"
+    end
   end
 
   def preload(repo, %module{} = struct, preloads, opts)
       when is_atom(repo) and is_atom(module) and is_list(opts) do
-    case preload(repo, [struct], preloads, opts) do
-      [loaded] -> loaded
+    if ector_schema_module?(module) do
+      case preload(repo, [struct], preloads, opts) do
+        [loaded] -> loaded
+      end
+    else
+      repo.preload(struct, preloads, opts)
     end
   end
 
@@ -267,6 +281,26 @@ defmodule Ector.Repo do
   end
 
   def preloadable?(_other), do: false
+
+  defp ector_preloadable_list?(structs) when is_list(structs) do
+    Enum.all?(structs, fn
+      nil -> true
+      %module{} -> ector_schema_module?(module)
+      _other -> false
+    end)
+  end
+
+  defp ecto_preloadable_list?(structs) when is_list(structs) do
+    Enum.any?(structs, &struct?/1) and
+      Enum.all?(structs, fn
+        nil -> true
+        %module{} -> ecto_schema_module?(module) and not ector_schema_module?(module)
+        _other -> false
+      end)
+  end
+
+  defp struct?(%module{}) when is_atom(module), do: true
+  defp struct?(_other), do: false
 
   @spec normalize_preloads(term()) :: [{atom(), term()}]
   defp normalize_preloads([]), do: []
@@ -324,20 +358,11 @@ defmodule Ector.Repo do
   defp preload_group_key({nil, _index}), do: nil
   defp preload_group_key({%module{}, _index}) when is_atom(module), do: module
 
-  defp preload_group_key({value, _index}) do
-    raise ArgumentError,
-          "expected an Ector schema struct or nil in preload list, got: #{inspect(value)}"
-  end
-
   @spec preload_association(module(), module(), [struct()], atom(), term(), Keyword.t()) :: [
           struct()
         ]
   defp preload_association(repo, module, parents, association_name, nested_preloads, opts)
        when is_atom(repo) and is_atom(module) and is_atom(association_name) do
-    unless ector_schema_module?(module) do
-      raise ArgumentError, "expected an Ector schema module, got: #{inspect(module)}"
-    end
-
     association = association!(module, association_name)
 
     unless ector_schema_module?(association.target) do
@@ -1258,10 +1283,14 @@ defmodule Ector.Repo do
 
   defp ector_queryable_module(_other), do: :error
 
-  defp ector_schema_module?(module) when is_atom(module) do
-    Code.ensure_loaded?(module) and function_exported?(module, :__ector_kind__, 0) and
+  defp ector_schema_module?(module) do
+    is_atom(module) and Ector.Schema.ector_schema?(module) and
       function_exported?(module, :__ector_label__, 0) and
       function_exported?(module, :__ector_table__, 0)
+  end
+
+  defp ecto_schema_module?(module) do
+    is_atom(module) and Code.ensure_loaded?(module) and function_exported?(module, :__schema__, 1)
   end
 
   defp fetch_property(properties, atom_key, string_key) do

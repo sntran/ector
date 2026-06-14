@@ -34,6 +34,9 @@ the unreleased history on this branch from the initial bootstrap on
   `belongs_to`, `has_many`, `has_one`, and nested preload traversal.
 - Added implicit edge routing for property-less associations, including reverse
   `belongs_to` fallback through the parent-side edge label.
+- Added `mix ector.migrate` to rewrite direct `use Ecto.Schema` modules to
+  `use Ector.Node` and optionally stream legacy relational data into
+  `nodes`/`edges`.
 
 ### Changed
 

@@ -17,18 +17,16 @@ defmodule Ector.Query do
 
   Ector schema modules are converted to `{table, module}` sources such as
   `{"nodes", MyApp.User}` and receive an automatic label filter. Other
-  queryables are delegated to `Ecto.Query.from/2` after expression options are
-  rewritten.
+  queryables are delegated to `Ecto.Query.from/2` without Ector field rewrites.
   """
   defmacro from(expr, opts \\ []) do
     unless Keyword.keyword?(opts) do
       raise ArgumentError, "second argument to `from` must be a compile time keyword list"
     end
 
-    rewritten_opts = rewrite_query_opts(opts)
-
     case rewrite_from_source(expr, __CALLER__) do
       {:ok, rewritten_expr, label_binding, module} ->
+        rewritten_opts = rewrite_query_opts(opts)
         label_var = Macro.unique_var(:ector_label, __MODULE__)
         label_filter = label_filter_ast(label_binding, label_var)
         opts_with_label = opts_with_label_filter(rewritten_opts, label_filter)
@@ -40,6 +38,7 @@ defmodule Ector.Query do
         end
 
       {:defer, deferred_expr, label_binding, module} ->
+        rewritten_opts = rewrite_query_opts(opts)
         source_var = Macro.unique_var(:ector_source, __MODULE__)
         label_var = Macro.unique_var(:ector_label, __MODULE__)
         label_filter = label_filter_ast(label_binding, label_var)
@@ -56,14 +55,14 @@ defmodule Ector.Query do
             unquote(label_var) = unquote(module).__ector_label__()
             Ecto.Query.from(unquote(rewritten_expr), unquote(opts_with_label))
           else
-            Ecto.Query.from(unquote(expr), unquote(rewritten_opts))
+            Ecto.Query.from(unquote(expr), unquote(opts))
           end
         end
 
       :error ->
         quote do
           require Ecto.Query
-          Ecto.Query.from(unquote(expr), unquote(rewritten_opts))
+          Ecto.Query.from(unquote(expr), unquote(opts))
         end
     end
   end
@@ -84,84 +83,49 @@ defmodule Ector.Query do
   Adds a `where` expression after rewriting domain field accesses.
   """
   defmacro where(query, binding \\ [], expr) do
-    rewritten_expr = rewrite_ast(expr)
-
-    quote do
-      require Ecto.Query
-      Ecto.Query.where(unquote(query), unquote(binding), unquote(rewritten_expr))
-    end
+    build_query_clause(:where, query, binding, expr)
   end
 
   @doc """
   Adds an `or_where` expression after rewriting domain field accesses.
   """
   defmacro or_where(query, binding \\ [], expr) do
-    rewritten_expr = rewrite_ast(expr)
-
-    quote do
-      require Ecto.Query
-      Ecto.Query.or_where(unquote(query), unquote(binding), unquote(rewritten_expr))
-    end
+    build_query_clause(:or_where, query, binding, expr)
   end
 
   @doc """
   Adds a `select` expression after rewriting domain field accesses.
   """
   defmacro select(query, binding \\ [], expr) do
-    rewritten_expr = rewrite_ast(expr)
-
-    quote do
-      require Ecto.Query
-      Ecto.Query.select(unquote(query), unquote(binding), unquote(rewritten_expr))
-    end
+    build_query_clause(:select, query, binding, expr)
   end
 
   @doc """
   Adds an `order_by` expression after rewriting domain field accesses.
   """
   defmacro order_by(query, binding \\ [], expr) do
-    rewritten_expr = rewrite_ast(expr)
-
-    quote do
-      require Ecto.Query
-      Ecto.Query.order_by(unquote(query), unquote(binding), unquote(rewritten_expr))
-    end
+    build_query_clause(:order_by, query, binding, expr)
   end
 
   @doc """
   Adds a `group_by` expression after rewriting domain field accesses.
   """
   defmacro group_by(query, binding \\ [], expr) do
-    rewritten_expr = rewrite_ast(expr)
-
-    quote do
-      require Ecto.Query
-      Ecto.Query.group_by(unquote(query), unquote(binding), unquote(rewritten_expr))
-    end
+    build_query_clause(:group_by, query, binding, expr)
   end
 
   @doc """
   Adds a `having` expression after rewriting domain field accesses.
   """
   defmacro having(query, binding \\ [], expr) do
-    rewritten_expr = rewrite_ast(expr)
-
-    quote do
-      require Ecto.Query
-      Ecto.Query.having(unquote(query), unquote(binding), unquote(rewritten_expr))
-    end
+    build_query_clause(:having, query, binding, expr)
   end
 
   @doc """
   Adds an `or_having` expression after rewriting domain field accesses.
   """
   defmacro or_having(query, binding \\ [], expr) do
-    rewritten_expr = rewrite_ast(expr)
-
-    quote do
-      require Ecto.Query
-      Ecto.Query.or_having(unquote(query), unquote(binding), unquote(rewritten_expr))
-    end
+    build_query_clause(:or_having, query, binding, expr)
   end
 
   @doc """
@@ -203,27 +167,34 @@ defmodule Ector.Query do
   end
 
   @doc false
-  @spec __join_source_module__(Ecto.Queryable.t(), atom() | nil) :: module()
-  def __join_source_module__(queryable, source_alias) do
+  @spec __join_source__(Ecto.Queryable.t(), atom() | nil) ::
+          {:ector, module()} | {:ecto, module()}
+  def __join_source__(queryable, source_alias) do
     query = Ecto.Queryable.to_query(queryable)
 
     case join_source(query, source_alias) do
       {:ok, {_source, module}} when is_atom(module) ->
-        if ector_schema_module?(module) do
-          module
-        else
-          raise ArgumentError, "expected an Ector schema module, got: #{inspect(module)}"
+        cond do
+          ector_schema_module?(module) ->
+            {:ector, module}
+
+          ecto_schema_module?(module) ->
+            {:ecto, module}
+
+          true ->
+            raise ArgumentError,
+                  "expected an Ecto or Ector schema module, got: #{inspect(module)}"
         end
 
       {:ok, source} ->
-        raise ArgumentError, "expected an Ector query source, got: #{inspect(source)}"
+        raise ArgumentError, "expected an Ecto or Ector query source, got: #{inspect(source)}"
 
       :error ->
         if is_nil(source_alias) do
           source = if query.from, do: query.from.source, else: nil
 
           raise ArgumentError,
-                "expected an Ector query source, got: #{inspect(source)}"
+                "expected an Ecto or Ector query source, got: #{inspect(source)}"
         else
           raise ArgumentError,
                 "unknown Ector join source alias #{inspect(source_alias)} in query"
@@ -251,6 +222,17 @@ defmodule Ector.Query do
     target_source_var = Macro.unique_var(:ector_target_source, __MODULE__)
     edge_source_var = Macro.unique_var(:ector_edge_source, __MODULE__)
 
+    standard_join =
+      standard_assoc_join_ast(
+        query_var,
+        qual,
+        binding,
+        target_binding,
+        source_binding,
+        association_name,
+        target_alias
+      )
+
     second_binding =
       if is_nil(source_alias) do
         binding ++ [{:..., [], []}, edge_binding]
@@ -275,62 +257,84 @@ defmodule Ector.Query do
 
       unquote(query_var) = unquote(query)
 
-      unquote(source_module_var) =
-        Ector.Query.__join_source_module__(unquote(query_var), unquote(source_alias))
+      case Ector.Query.__join_source__(unquote(query_var), unquote(source_alias)) do
+        {:ecto, _source_module} ->
+          unquote(standard_join)
 
-      unquote(association_var) =
-        Ector.Query.__association__!(
-          unquote(source_module_var),
-          unquote(association_name)
-        )
+        {:ector, unquote(source_module_var)} ->
+          unquote(association_var) =
+            Ector.Query.__association__!(
+              unquote(source_module_var),
+              unquote(association_name)
+            )
 
-      unquote(edge_label_var) =
-        Ector.Query.__edge_label__(unquote(association_var))
+          if Ector.Query.__ector_schema_module__(unquote(association_var).target) do
+            unquote(edge_label_var) =
+              Ector.Query.__edge_label__(unquote(association_var))
 
-      unquote(target_label_var) = unquote(association_var).target.__ector_label__()
+            unquote(target_label_var) = unquote(association_var).target.__ector_label__()
 
-      unquote(target_source_var) =
-        {unquote(association_var).target.__ector_table__() |> Atom.to_string(),
-         unquote(association_var).target}
+            unquote(target_source_var) =
+              {unquote(association_var).target.__ector_table__() |> Atom.to_string(),
+               unquote(association_var).target}
 
-      unquote(edge_source_var) = {"edges", Ector.Edge}
+            unquote(edge_source_var) = {"edges", Ector.Edge}
 
-      case unquote(association_var).direction do
-        :outgoing ->
-          unquote(query_var)
-          |> Ecto.Query.join(
-            unquote(qual),
-            unquote(binding),
-            unquote(edge_binding) in ^unquote(edge_source_var),
-            as: unquote(edge_alias),
-            on: unquote(outgoing_edge_on)
-          )
-          |> Ecto.Query.join(
-            unquote(qual),
-            unquote(second_binding),
-            unquote(target_binding) in ^unquote(target_source_var),
-            as: unquote(target_alias),
-            on: unquote(outgoing_target_on)
-          )
+            case unquote(association_var).direction do
+              :outgoing ->
+                unquote(query_var)
+                |> Ecto.Query.join(
+                  unquote(qual),
+                  unquote(binding),
+                  unquote(edge_binding) in ^unquote(edge_source_var),
+                  as: unquote(edge_alias),
+                  on: unquote(outgoing_edge_on)
+                )
+                |> Ecto.Query.join(
+                  unquote(qual),
+                  unquote(second_binding),
+                  unquote(target_binding) in ^unquote(target_source_var),
+                  as: unquote(target_alias),
+                  on: unquote(outgoing_target_on)
+                )
 
-        :incoming ->
-          unquote(query_var)
-          |> Ecto.Query.join(
-            unquote(qual),
-            unquote(binding),
-            unquote(edge_binding) in ^unquote(edge_source_var),
-            as: unquote(edge_alias),
-            on: unquote(incoming_edge_on)
-          )
-          |> Ecto.Query.join(
-            unquote(qual),
-            unquote(second_binding),
-            unquote(target_binding) in ^unquote(target_source_var),
-            as: unquote(target_alias),
-            on: unquote(incoming_target_on)
-          )
+              :incoming ->
+                unquote(query_var)
+                |> Ecto.Query.join(
+                  unquote(qual),
+                  unquote(binding),
+                  unquote(edge_binding) in ^unquote(edge_source_var),
+                  as: unquote(edge_alias),
+                  on: unquote(incoming_edge_on)
+                )
+                |> Ecto.Query.join(
+                  unquote(qual),
+                  unquote(second_binding),
+                  unquote(target_binding) in ^unquote(target_source_var),
+                  as: unquote(target_alias),
+                  on: unquote(incoming_target_on)
+                )
+            end
+          else
+            unquote(standard_join)
+          end
       end
     end
+  end
+
+  defp standard_assoc_join_ast(
+         query,
+         qual,
+         binding,
+         target_binding,
+         source_binding,
+         association_name,
+         target_alias
+       ) do
+    assoc_ast = {:assoc, [], [source_binding, association_name]}
+    join_expr = {:in, [], [target_binding, assoc_ast]}
+
+    {{:., [], [Ecto.Query, :join]}, [], [query, qual, binding, join_expr, [as: target_alias]]}
   end
 
   @doc false
@@ -349,6 +353,40 @@ defmodule Ector.Query do
   @doc false
   @spec __ector_schema_module__(module()) :: boolean()
   def __ector_schema_module__(module) when is_atom(module), do: ector_schema_module?(module)
+
+  @doc false
+  @spec __ector_query__(term()) :: boolean()
+  def __ector_query__(queryable) do
+    queryable
+    |> Ecto.Queryable.to_query()
+    |> ector_query?()
+  rescue
+    _error -> false
+  end
+
+  defp build_query_clause(clause, query, binding, expr)
+       when clause in @rewritable_clauses do
+    query_var = Macro.unique_var(:ector_query, __MODULE__)
+    rewritten_expr = rewrite_ast(expr)
+    rewritten_call = query_clause_call(clause, query_var, binding, rewritten_expr)
+    original_call = query_clause_call(clause, query_var, binding, expr)
+
+    quote do
+      require Ecto.Query
+
+      unquote(query_var) = unquote(query)
+
+      if Ector.Query.__ector_query__(unquote(query_var)) do
+        unquote(rewritten_call)
+      else
+        unquote(original_call)
+      end
+    end
+  end
+
+  defp query_clause_call(clause, query, binding, expr) do
+    {{:., [], [Ecto.Query, clause]}, [], [query, binding, expr]}
+  end
 
   defp module_associations(module) when is_atom(module) do
     module
@@ -487,7 +525,7 @@ defmodule Ector.Query do
   end
 
   defp edge_schema_module?(module) when is_atom(module) do
-    Code.ensure_loaded?(module) and function_exported?(module, :__ector_kind__, 0) and
+    Ector.Schema.ector_schema?(module) and
       function_exported?(module, :__ector_label__, 0) and module.__ector_kind__() == :edge
   end
 
@@ -702,9 +740,19 @@ defmodule Ector.Query do
     {module.__ector_table__() |> Atom.to_string(), module}
   end
 
-  defp ector_schema_module?(module) when is_atom(module) do
-    Code.ensure_loaded?(module) and function_exported?(module, :__ector_kind__, 0) and
+  defp ector_query?(%Ecto.Query{from: %{source: {_source, module}}}) when is_atom(module) do
+    ector_schema_module?(module)
+  end
+
+  defp ector_query?(_query), do: false
+
+  defp ector_schema_module?(module) do
+    is_atom(module) and Ector.Schema.ector_schema?(module) and
       function_exported?(module, :__ector_label__, 0) and
       function_exported?(module, :__ector_table__, 0)
+  end
+
+  defp ecto_schema_module?(module) do
+    is_atom(module) and Code.ensure_loaded?(module) and function_exported?(module, :__schema__, 1)
   end
 end
