@@ -52,6 +52,16 @@ defmodule Ector.Repo do
                      all: 2,
                      one: 1,
                      one: 2,
+                     one!: 1,
+                     one!: 2,
+                     get: 2,
+                     get: 3,
+                     get!: 2,
+                     get!: 3,
+                     get_by: 2,
+                     get_by: 3,
+                     get_by!: 2,
+                     get_by!: 3,
                      insert: 1,
                      insert: 2,
                      update: 1,
@@ -70,6 +80,27 @@ defmodule Ector.Repo do
 
       def one(queryable, opts \\ []),
         do: Ector.Repo.one(__MODULE__, queryable, opts, fn q, o -> super(q, o) end)
+
+      def one!(queryable, opts \\ []),
+        do: Ector.Repo.one!(__MODULE__, queryable, opts, fn q, o -> super(q, o) end)
+
+      def get(queryable, id, opts \\ []),
+        do: Ector.Repo.get(__MODULE__, queryable, id, opts, fn q, i, o -> super(q, i, o) end)
+
+      def get!(queryable, id, opts \\ []),
+        do: Ector.Repo.get!(__MODULE__, queryable, id, opts, fn q, i, o -> super(q, i, o) end)
+
+      def get_by(queryable, clauses, opts \\ []),
+        do:
+          Ector.Repo.get_by(__MODULE__, queryable, clauses, opts, fn q, c, o ->
+            super(q, c, o)
+          end)
+
+      def get_by!(queryable, clauses, opts \\ []),
+        do:
+          Ector.Repo.get_by!(__MODULE__, queryable, clauses, opts, fn q, c, o ->
+            super(q, c, o)
+          end)
 
       def insert(struct_or_changeset, opts \\ []),
         do: Ector.Repo.insert(__MODULE__, struct_or_changeset, opts, fn s, o -> super(s, o) end)
@@ -130,6 +161,82 @@ defmodule Ector.Repo do
 
       :error ->
         fallback.(queryable, opts)
+    end
+  end
+
+  @doc false
+  @spec one!(module(), term(), Keyword.t(), (term(), Keyword.t() -> term())) :: term()
+  def one!(repo, queryable, opts, fallback)
+      when is_atom(repo) and is_list(opts) and is_function(fallback, 2) do
+    case one(repo, queryable, opts, fallback) do
+      nil -> raise Ecto.NoResultsError, queryable: one_queryable_for_exception(queryable)
+      result -> result
+    end
+  end
+
+  @doc false
+  @spec get(module(), term(), term(), Keyword.t(), (term(), term(), Keyword.t() -> term())) ::
+          term()
+  def get(repo, queryable, id, opts, fallback)
+      when is_atom(repo) and is_list(opts) and is_function(fallback, 3) do
+    cond do
+      ecto_schema_module?(queryable) and not ector_schema_module?(queryable) ->
+        fallback.(queryable, id, opts)
+
+      ector_schema_module?(queryable) ->
+        queryable
+        |> get_query(id)
+        |> one_storage_row(repo, opts)
+
+      true ->
+        fallback.(queryable, id, opts)
+    end
+  end
+
+  @doc false
+  @spec get!(module(), term(), term(), Keyword.t(), (term(), term(), Keyword.t() -> term())) ::
+          term()
+  def get!(repo, queryable, id, opts, fallback)
+      when is_atom(repo) and is_list(opts) and is_function(fallback, 3) do
+    case get(repo, queryable, id, opts, fallback) do
+      nil -> raise Ecto.NoResultsError, queryable: get_queryable_for_exception(queryable, id)
+      result -> result
+    end
+  end
+
+  @doc false
+  @spec get_by(module(), term(), map() | Keyword.t(), Keyword.t(), (term(),
+                                                                    map()
+                                                                    | Keyword.t(),
+                                                                    Keyword.t() ->
+                                                                      term())) :: term()
+  def get_by(repo, queryable, clauses, opts, fallback)
+      when is_atom(repo) and is_list(opts) and is_function(fallback, 3) do
+    cond do
+      ecto_schema_module?(queryable) and not ector_schema_module?(queryable) ->
+        fallback.(queryable, clauses, opts)
+
+      ector_schema_module?(queryable) ->
+        queryable
+        |> get_by_query(clauses)
+        |> one_storage_row(repo, opts)
+
+      true ->
+        fallback.(queryable, clauses, opts)
+    end
+  end
+
+  @doc false
+  @spec get_by!(module(), term(), map() | Keyword.t(), Keyword.t(), (term(),
+                                                                     map()
+                                                                     | Keyword.t(),
+                                                                     Keyword.t() ->
+                                                                       term())) :: term()
+  def get_by!(repo, queryable, clauses, opts, fallback)
+      when is_atom(repo) and is_list(opts) and is_function(fallback, 3) do
+    case get_by(repo, queryable, clauses, opts, fallback) do
+      nil -> raise Ecto.NoResultsError, queryable: elem(get_by_query(queryable, clauses), 1)
+      result -> result
     end
   end
 
@@ -815,10 +922,8 @@ defmodule Ector.Repo do
   @spec hydrate(module(), storage_row()) :: struct()
   defp hydrate(module, %{id: hidden_id, properties: properties})
        when is_atom(module) and is_map(properties) do
-    property_fields = module.__schema__(:fields) -- [:__id__]
-
     property_values =
-      Enum.reduce(property_fields, %{}, fn field_name, acc ->
+      Enum.reduce(property_fields(module), %{}, fn field_name, acc ->
         key = Atom.to_string(field_name)
 
         case fetch_property(properties, field_name, key) do
@@ -957,7 +1062,7 @@ defmodule Ector.Repo do
 
         case insert_storage_rows(repo, storage_schema(module), [row], opts) do
           {1, _} ->
-            struct = hydrate(module, row)
+            struct = persisted_struct(changeset, hidden_id)
 
             case persist_edges(repo, struct, changeset, hidden_id, opts) do
               :ok -> {:ok, {struct, hidden_id}}
@@ -1101,7 +1206,95 @@ defmodule Ector.Repo do
   end
 
   defp property_fields(module) when is_atom(module) do
-    module.__schema__(:fields) -- [:__id__]
+    fields = module.__schema__(:fields)
+    virtual_fields = module.__schema__(:virtual_fields)
+
+    fields
+    |> Kernel.--(virtual_fields)
+    |> List.delete(:__id__)
+  end
+
+  defp persisted_struct(%Changeset{} = changeset, hidden_id) do
+    changeset
+    |> Changeset.apply_changes()
+    |> Map.put(:__id__, hidden_id)
+  end
+
+  defp one_storage_row({module, query}, repo, opts) do
+    case one(repo, query, opts, fn storage_query, storage_opts ->
+           repo.one(storage_query, storage_opts)
+         end) do
+      nil -> nil
+      row -> hydrate_storage_row(module, row)
+    end
+  end
+
+  defp get_query(module, id) when is_atom(module) do
+    primary_key = primary_key!(module)
+    get_by_query(module, [{primary_key, id}])
+  end
+
+  defp get_by_query(module, clauses) when is_atom(module) do
+    filters = normalize_get_by_clauses!(clauses)
+
+    query =
+      Enum.reduce(filters, base_storage_query(module), fn {field_name, value}, query ->
+        storage_where(query, field_name, value)
+      end)
+
+    {module, query}
+  end
+
+  defp get_queryable_for_exception(module, id) when is_atom(module) do
+    module
+    |> get_query(id)
+    |> elem(1)
+  end
+
+  defp one_queryable_for_exception(queryable) do
+    case storage_select_query(queryable) do
+      {:ok, _module, query, _hydration} -> query
+      :error -> queryable
+    end
+  end
+
+  defp base_storage_query(module) when is_atom(module) do
+    from(row in storage_schema(module), where: field(row, :label) == ^module.__ector_label__())
+  end
+
+  defp storage_where(query, :__id__, value) do
+    from(row in query, where: field(row, :id) == ^value)
+  end
+
+  defp storage_where(query, field_name, value) when is_atom(field_name) do
+    key = Atom.to_string(field_name)
+    from(row in query, where: row.properties[^key] == ^value)
+  end
+
+  defp storage_where(query, field_name, value) when is_binary(field_name) and field_name != "" do
+    from(row in query, where: row.properties[^field_name] == ^value)
+  end
+
+  defp normalize_get_by_clauses!(clauses) when is_list(clauses), do: clauses
+  defp normalize_get_by_clauses!(%{} = clauses), do: Map.to_list(clauses)
+
+  defp normalize_get_by_clauses!(clauses) do
+    raise ArgumentError,
+          "expected get_by clauses to be a keyword list or map, got: #{inspect(clauses)}"
+  end
+
+  defp primary_key!(module) when is_atom(module) do
+    case module.__schema__(:primary_key) do
+      [primary_key] ->
+        primary_key
+
+      [] ->
+        :id
+
+      primary_keys ->
+        raise ArgumentError,
+              "expected #{inspect(module)} to have exactly one primary key, got: #{inspect(primary_keys)}"
+    end
   end
 
   defp extract_property_updates(updates) when is_list(updates) do

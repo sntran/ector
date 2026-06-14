@@ -28,7 +28,9 @@ defmodule Ector.RepoTest do
     use Ector.Node
 
     schema do
+      field(:email, :string)
       field(:name, :string)
+      field(:password, :string, virtual: true)
       field(:metadata, :map, default: %{})
       field(:tags, {:array, :string}, default: [])
       field(:visits, :integer, default: 0)
@@ -68,6 +70,26 @@ defmodule Ector.RepoTest do
       field(:bio, :string)
 
       belongs_to(:user, Ector.RepoTest.User, through: :user_profiles)
+    end
+  end
+
+  defmodule ExternalKeyUser do
+    use Ector.Node
+
+    @primary_key {:external_id, :string, []}
+    schema do
+      field(:name, :string)
+    end
+  end
+
+  defmodule CompositeKeyUser do
+    use Ector.Node
+
+    @primary_key false
+    schema do
+      field(:tenant_id, :string, primary_key: true)
+      field(:user_id, :string, primary_key: true)
+      field(:name, :string)
     end
   end
 
@@ -755,6 +777,160 @@ defmodule Ector.RepoTest do
     assert user.name == "Lin"
     assert user.metadata == %{"tier" => "pro"}
     assert user.__id__ == hidden_id
+  end
+
+  test "insert/2 keeps virtual fields on returned structs but excludes them from properties" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert {:ok, %User{} = user} =
+             repo.insert(
+               User.changeset(%User{}, %{
+                 "id" => "auth-user",
+                 "email" => "auth@example.com",
+                 "name" => "Auth",
+                 "password" => "not-persisted"
+               })
+             )
+
+    assert user.password == "not-persisted"
+
+    assert [[properties]] = Ector.TestRepo.query!("SELECT properties FROM nodes").rows
+
+    decoded_properties = decode_properties(properties)
+
+    assert decoded_properties["email"] == "auth@example.com"
+    refute Map.has_key?(decoded_properties, "password")
+  end
+
+  test "get get! get_by get_by! and one! return Ector node structs" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert {:ok, %User{} = user} =
+             repo.insert(
+               User.changeset(%User{}, %{
+                 "id" => "get-user",
+                 "email" => "user@example.com",
+                 "name" => "Lookup"
+               })
+             )
+
+    assert %User{id: "get-user", email: "user@example.com", __id__: hidden_id} =
+             repo.get(User, "get-user")
+
+    assert hidden_id == user.__id__
+
+    assert %User{id: "get-user", email: "user@example.com", __id__: ^hidden_id} =
+             repo.get!(User, "get-user")
+
+    assert %User{id: "get-user", email: "user@example.com", __id__: ^hidden_id} =
+             repo.get_by(User, email: "user@example.com")
+
+    assert %User{id: "get-user", email: "user@example.com", __id__: ^hidden_id} =
+             repo.get_by!(User, %{email: "user@example.com"})
+
+    assert %User{id: "get-user", email: "user@example.com", __id__: ^hidden_id} =
+             repo.one!(User)
+  end
+
+  test "get get! get_by and get_by! delegate standard Ecto schemas to relational tables" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert {:ok, %LegacyUser{id: "legacy-get", email: "legacy@example.com"}} =
+             repo.insert(%LegacyUser{id: "legacy-get", email: "legacy@example.com"})
+
+    assert %LegacyUser{id: "legacy-get", email: "legacy@example.com"} =
+             repo.get(LegacyUser, "legacy-get")
+
+    assert %LegacyUser{id: "legacy-get", email: "legacy@example.com"} =
+             repo.get!(LegacyUser, "legacy-get")
+
+    assert %LegacyUser{id: "legacy-get", email: "legacy@example.com"} =
+             repo.get_by(LegacyUser, email: "legacy@example.com")
+
+    assert %LegacyUser{id: "legacy-get", email: "legacy@example.com"} =
+             repo.get_by!(LegacyUser, %{email: "legacy@example.com"})
+
+    assert Ector.TestRepo.query!("SELECT COUNT(*) FROM nodes").rows == [[0]]
+  end
+
+  test "bang single-record functions raise Ecto.NoResultsError when records are missing" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert_raise Ecto.NoResultsError, fn -> repo.get!(User, "missing-user") end
+    assert_raise Ecto.NoResultsError, fn -> repo.get_by!(User, email: "missing@example.com") end
+    assert_raise Ecto.NoResultsError, fn -> repo.one!(User) end
+
+    assert_raise Ecto.NoResultsError, fn -> repo.get!(LegacyUser, "missing-legacy") end
+
+    assert_raise Ecto.NoResultsError, fn ->
+      repo.get_by!(LegacyUser, email: "missing@example.com")
+    end
+  end
+
+  test "single-record helpers cover fallback and defensive Ector query branches" do
+    repo = Ector.TestRepo.repo_module()
+
+    assert_raise Ecto.NoResultsError, fn ->
+      Ector.Repo.one!(repo, User, [], fn _query, _opts -> nil end)
+    end
+
+    assert_raise Ecto.NoResultsError, fn ->
+      Ector.Repo.one!(repo, "plain_widgets", [], fn _query, _opts -> nil end)
+    end
+
+    assert {:fallback, :not_a_schema, "id-1", [timeout: 1000]} =
+             Ector.Repo.get(repo, :not_a_schema, "id-1", [timeout: 1000], fn queryable,
+                                                                             id,
+                                                                             opts ->
+               {:fallback, queryable, id, opts}
+             end)
+
+    assert {:fallback, :not_a_schema, [email: "user@example.com"], []} =
+             Ector.Repo.get_by(repo, :not_a_schema, [email: "user@example.com"], [], fn queryable,
+                                                                                        clauses,
+                                                                                        opts ->
+               {:fallback, queryable, clauses, opts}
+             end)
+
+    hidden_id = Ecto.UUID.autogenerate(version: 7, precision: :monotonic)
+
+    assert {1, nil} =
+             repo.insert_all(node_insert_target(), [
+               %{
+                 id: hidden_id,
+                 label: User.__ector_label__(),
+                 properties:
+                   encoded_properties(%{
+                     "id" => "string-key-user",
+                     "email" => "string-key@example.com",
+                     "name" => "String Key"
+                   })
+               }
+             ])
+
+    assert %User{id: "string-key-user", __id__: ^hidden_id} = repo.get_by(User, __id__: hidden_id)
+
+    assert %User{id: "string-key-user", __id__: ^hidden_id} =
+             repo.get_by(User, %{"email" => "string-key@example.com"})
+
+    assert_raise ArgumentError, ~r/expected get_by clauses/, fn ->
+      repo.get_by(User, :not_clauses)
+    end
+
+    assert {:ok, %ExternalKeyUser{external_id: "external-1"}} =
+             repo.insert(
+               ExternalKeyUser.changeset(%ExternalKeyUser{}, %{
+                 "external_id" => "external-1",
+                 "name" => "External"
+               })
+             )
+
+    assert %ExternalKeyUser{external_id: "external-1", name: "External"} =
+             repo.get(ExternalKeyUser, "external-1")
+
+    assert_raise ArgumentError, ~r/exactly one primary key/, fn ->
+      repo.get(CompositeKeyUser, "missing")
+    end
   end
 
   test "all/4 one/4 delete_all/4 and update_all/5 rewrite executable Ector queries" do
@@ -1522,6 +1698,9 @@ defmodule Ector.RepoTest do
   defp encoded_properties(properties) do
     if Ector.TestRepo.sqlite?(), do: Ector.Translator.encode_json!(properties), else: properties
   end
+
+  defp decode_properties(properties) when is_binary(properties), do: JSON.decode!(properties)
+  defp decode_properties(properties) when is_map(properties), do: properties
 
   defp hidden_id_field_access?(ast) do
     ast_contains?(ast, fn

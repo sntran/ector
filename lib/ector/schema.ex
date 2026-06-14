@@ -122,7 +122,10 @@ defmodule Ector.Schema do
 
           def changeset(struct, attrs) when is_map(attrs) do
             struct
-            |> Ecto.Changeset.cast(attrs, __schema__(:fields) -- [:__id__])
+            |> Ecto.Changeset.cast(
+              attrs,
+              (__schema__(:fields) ++ __schema__(:virtual_fields)) -- [:__id__]
+            )
           end
 
           def changeset(struct, _attrs) do
